@@ -1,0 +1,364 @@
+-- Rick & Morty Portal Gun (Full-Screen Portal FX, Blur, Slow-Mo & Custom Sound)
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local TweenService = game:GetService("TweenService")
+local SoundService = game:GetService("SoundService")
+local Lighting = game:GetService("Lighting")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- 1. ЗВУКИ (Глубокий замедленный всплеск)
+local function createSound(soundId, volume, pitch)
+	local sound = Instance.new("Sound")
+	sound.SoundId = soundId
+	sound.Volume = volume or 1
+	sound.Pitch = pitch or 1
+	sound.Parent = SoundService
+	return sound
+end
+
+local shootSound = createSound("rbxassetid://9120584388", 1.2, 1.2)
+local teleportSound = createSound("rbxassetid://9120584388", 1.8, 0.65)
+
+-- 2. ЭФФЕКТ ВХОДА (ПОЛНОЭКРАННАЯ ВСПЫШКА И РАЗМЫТИЕ)
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local flashGui = Instance.new("ScreenGui")
+flashGui.Name = "PortalFXGui"
+flashGui.ResetOnSpawn = false
+flashGui.IgnoreGuiInset = true -- Игнорирует верхнюю панель Roblox (эффект на весь экран)
+flashGui.Parent = playerGui
+
+local flashFrame = Instance.new("Frame")
+flashFrame.Size = UDim2.new(1, 0, 1, 0)
+flashFrame.Position = UDim2.new(0, 0, 0, 0)
+flashFrame.BackgroundColor3 = Color3.fromRGB(50, 255, 80)
+flashFrame.BackgroundTransparency = 1
+flashFrame.BorderSizePixel = 0
+flashFrame.Parent = flashGui
+
+-- Размытие в Lighting
+local portalBlur = Instance.new("BlurEffect")
+portalBlur.Size = 0
+portalBlur.Enabled = true
+portalBlur.Parent = Lighting
+
+local function playPortalScreenEffect(humanoid)
+	-- 1. Зеленая полноэкранная вспышка
+	flashFrame.BackgroundTransparency = 0.25
+	local flashTween = TweenService:Create(flashFrame, TweenInfo.new(0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		BackgroundTransparency = 1
+	})
+	flashTween:Play()
+
+	-- 2. Эффект размытия
+	portalBlur.Size = 28
+	local blurTween = TweenService:Create(portalBlur, TweenInfo.new(0.7, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
+		Size = 0
+	})
+	blurTween:Play()
+
+	-- 3. Легкое замедление
+	if humanoid then
+		local origSpeed = humanoid.WalkSpeed
+		humanoid.WalkSpeed = 6
+		task.delay(0.5, function()
+			humanoid.WalkSpeed = origSpeed
+		end)
+	end
+end
+
+-- 3. ЛУЧ ВЫСТРЕЛА
+local function drawLaserBeam(startPos, endPos)
+	local distance = (startPos - endPos).Magnitude
+	local beam = Instance.new("Part")
+	beam.Size = Vector3.new(0.25, 0.25, distance)
+	beam.Material = Enum.Material.Neon
+	beam.Color = Color3.fromRGB(50, 255, 50)
+	beam.Anchored = true
+	beam.CanCollide = false
+	beam.CFrame = CFrame.new(startPos:Lerp(endPos, 0.5), endPos)
+	beam.Parent = workspace
+
+	local tweenInfo = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	local tween = TweenService:Create(beam, tweenInfo, {
+		Transparency = 1,
+		Size = Vector3.new(0.01, 0.01, distance)
+	})
+	tween:Play()
+	tween.Completed:Connect(function()
+		beam:Destroy()
+	end)
+end
+
+-- 4. ПОРТАЛЫ И ТЕЛЕПОРТАЦИЯ
+local portal1 = nil
+local portal2 = nil
+local currentPortalIndex = 1
+local isTeleporting = false
+
+local function createPortalFX()
+	local pModel = Instance.new("Model")
+
+	local base = Instance.new("Part")
+	base.Name = "PortalBase"
+	base.Shape = Enum.PartType.Cylinder
+	base.Size = Vector3.new(0.05, 6.5, 6.5)
+	base.Anchored = true
+	base.CanCollide = false
+	base.Material = Enum.Material.Neon
+	base.Color = Color3.fromRGB(50, 255, 50)
+	base.Transparency = 0.2
+	base.Parent = pModel
+
+	local d1 = Instance.new("Decal")
+	d1.Texture = "rbxassetid://243664672"
+	d1.Face = Enum.NormalId.Right
+	d1.Parent = base
+
+	local d2 = Instance.new("Decal")
+	d2.Texture = "rbxassetid://243664672"
+	d2.Face = Enum.NormalId.Left
+	d2.Parent = base
+
+	local att = Instance.new("Attachment", base)
+	local pe = Instance.new("ParticleEmitter")
+	pe.Texture = "rbxassetid://243664672"
+	pe.Color = ColorSequence.new(Color3.fromRGB(80, 255, 80))
+	pe.Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 5.5), NumberSequenceKeypoint.new(1, 0)})
+	pe.Lifetime = NumberRange.new(0.5, 1)
+	pe.Rate = 40
+	pe.RotSpeed = NumberRange.new(200, 400)
+	pe.Parent = att
+
+	pModel.PrimaryPart = base
+	return pModel
+end
+
+local function resetPortals()
+	if portal1 then portal1:Destroy() portal1 = nil end
+	if portal2 then portal2:Destroy() portal2 = nil end
+	currentPortalIndex = 1
+end
+
+local function setupTeleport(srcModel, tgtModel)
+	if not srcModel or not tgtModel then return end
+	local src = srcModel.PrimaryPart
+	local tgt = tgtModel.PrimaryPart
+
+	src.Touched:Connect(function(hit)
+		if isTeleporting or not tgt or not tgt.Parent then return end
+		local char = hit.Parent
+		if not char or char ~= LocalPlayer.Character then return end
+		
+		local root = char:FindFirstChild("HumanoidRootPart")
+		local hum = char:FindFirstChildOfClass("Humanoid")
+
+		if hum and root and hum.Health > 0 then
+			isTeleporting = true
+			
+			teleportSound:Play()
+			playPortalScreenEffect(hum)
+			
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+			
+			local normal = tgt.CFrame.RightVector
+			local targetCFrame
+
+			if math.abs(normal.Y) > 0.6 then
+				targetCFrame = CFrame.new(tgt.Position + Vector3.new(0, 3.5, 0))
+			else
+				targetCFrame = CFrame.new(tgt.Position + (normal * 3.5) + Vector3.new(0, 1, 0), tgt.Position + (normal * 10))
+			end
+
+			char:PivotTo(targetCFrame)
+
+			task.defer(function()
+				if root then
+					root.AssemblyLinearVelocity = Vector3.zero
+					root.AssemblyAngularVelocity = Vector3.zero
+				end
+			end)
+			
+			task.wait(1.4)
+			isTeleporting = false
+		end
+	end)
+end
+
+-- 5. ПУШКА С ДИСПЛЕЕМ
+local function buildPortalGun()
+	local portalGun = Instance.new("Tool")
+	portalGun.Name = "Portal Gun"
+	portalGun.RequiresHandle = true
+	portalGun.CanBeDropped = false
+
+	local handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Size = Vector3.new(0.3, 0.8, 0.3)
+	handle.Transparency = 1
+	handle.CanCollide = false
+	handle.Parent = portalGun
+
+	local gunModel = Instance.new("Model")
+	gunModel.Name = "RickPortalGunModel"
+	gunModel.Parent = portalGun
+
+	local function attach(part, offsetCFrame)
+		part.CanCollide = false
+		part.Massless = true
+		part.CFrame = handle.CFrame * offsetCFrame
+		part.Parent = gunModel
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0 = handle
+		weld.Part1 = part
+		weld.Parent = handle
+	end
+
+	local grip = Instance.new("Part")
+	grip.Shape = Enum.PartType.Cylinder
+	grip.Size = Vector3.new(1.1, 0.32, 0.32)
+	grip.Color = Color3.fromRGB(175, 180, 185)
+	grip.Material = Enum.Material.SmoothPlastic
+	attach(grip, CFrame.new(0, -0.3, 0.4) * CFrame.Angles(0, 0, math.rad(75)))
+
+	local bodyBase = Instance.new("Part")
+	bodyBase.Size = Vector3.new(1.1, 0.55, 2.0)
+	bodyBase.Color = Color3.fromRGB(220, 222, 225)
+	bodyBase.Material = Enum.Material.SmoothPlastic
+	attach(bodyBase, CFrame.new(0, 0.25, -0.4))
+
+	local shootPoint = Instance.new("Part")
+	shootPoint.Name = "ShootPoint"
+	shootPoint.Size = Vector3.new(0.1, 0.1, 0.1)
+	shootPoint.Transparency = 1
+	shootPoint.CanCollide = false
+	attach(shootPoint, CFrame.new(0, 0.23, -1.5))
+
+	-- КРАСНЫЙ ДИСПЛЕЙ
+	local screenDisplay = Instance.new("Part")
+	screenDisplay.Size = Vector3.new(0.7, 0.02, 0.5)
+	screenDisplay.Color = Color3.fromRGB(10, 10, 10)
+	screenDisplay.Material = Enum.Material.SmoothPlastic
+	attach(screenDisplay, CFrame.new(0, 0.53, -0.25))
+
+	local surfaceGui = Instance.new("SurfaceGui")
+	surfaceGui.Face = Enum.NormalId.Top
+	surfaceGui.Parent = screenDisplay
+
+	local ledText = Instance.new("TextLabel")
+	ledText.Size = UDim2.new(1, 0, 1, 0)
+	ledText.BackgroundColor3 = Color3.fromRGB(15, 0, 0)
+	ledText.Text = "C-137"
+	ledText.TextColor3 = Color3.fromRGB(255, 30, 30)
+	ledText.TextScaled = true
+	ledText.Font = Enum.Font.Code
+	ledText.Parent = surfaceGui
+
+	for i = -1, 1 do
+		local emitter = Instance.new("Part")
+		emitter.Shape = Enum.PartType.Cylinder
+		emitter.Size = Vector3.new(0.25, 0.26, 0.26)
+		emitter.Color = Color3.fromRGB(50, 255, 50)
+		emitter.Material = Enum.Material.Neon
+		attach(emitter, CFrame.new(i * 0.3, 0.23, -1.43) * CFrame.Angles(0, math.rad(90), 0))
+	end
+
+	local domeGlass = Instance.new("Part")
+	domeGlass.Shape = Enum.PartType.Cylinder
+	domeGlass.Size = Vector3.new(0.9, 0.7, 0.7)
+	domeGlass.Color = Color3.fromRGB(220, 245, 255)
+	domeGlass.Material = Enum.Material.Glass
+	domeGlass.Transparency = 0.4
+	attach(domeGlass, CFrame.new(0, 0.85, 0.35) * CFrame.Angles(0, 0, math.rad(90)))
+
+	local coreBall = Instance.new("Part")
+	coreBall.Shape = Enum.PartType.Ball
+	coreBall.Size = Vector3.new(0.5, 0.5, 0.5)
+	coreBall.Color = Color3.fromRGB(40, 255, 40)
+	coreBall.Material = Enum.Material.Neon
+	attach(coreBall, CFrame.new(0, 0.88, 0.35))
+
+	portalGun.Activated:Connect(function()
+		local mouse = LocalPlayer:GetMouse()
+		local ray = Workspace:Raycast(mouse.UnitRay.Origin, mouse.UnitRay.Direction * 500)
+		if not ray then return end
+
+		shootSound:Play()
+		ledText.Text = "C-" .. tostring(math.random(100, 999))
+
+		local hitPos = ray.Position
+		local normal = ray.Normal
+		
+		drawLaserBeam(shootPoint.Position, hitPos)
+
+		local adjustedPos = hitPos + (normal * 0.1)
+		local portalCFrame = CFrame.lookAt(adjustedPos, adjustedPos + normal) * CFrame.Angles(0, math.rad(90), 0)
+
+		if currentPortalIndex == 1 then
+			if portal1 then portal1:Destroy() end
+			portal1 = createPortalFX()
+			portal1:SetPrimaryPartCFrame(portalCFrame)
+			portal1.Parent = workspace
+
+			setupTeleport(portal1, portal2)
+			if portal2 then setupTeleport(portal2, portal1) end
+			currentPortalIndex = 2
+		else
+			if portal2 then portal2:Destroy() end
+			portal2 = createPortalFX()
+			portal2:SetPrimaryPartCFrame(portalCFrame)
+			portal2.Parent = workspace
+
+			setupTeleport(portal2, portal1)
+			setupTeleport(portal1, portal2)
+			currentPortalIndex = 1
+		end
+	end)
+
+	return portalGun
+end
+
+-- ВЫДАЧА И ЭКИПИРОВКА
+local currentTool = nil
+local function equipTool()
+	if currentTool and currentTool.Parent then currentTool:Destroy() end
+	local backpack = LocalPlayer:WaitForChild("Backpack")
+	currentTool = buildPortalGun()
+	currentTool.Parent = backpack
+end
+
+equipTool()
+LocalPlayer.CharacterAdded:Connect(function()
+	task.wait(0.5)
+	equipTool()
+end)
+
+-- UI КНОПКА RESET
+local sg = Instance.new("ScreenGui", game.CoreGui)
+sg.Name = "PortalGunUI"
+
+local btn = Instance.new("TextButton")
+btn.Size = UDim2.new(0, 140, 0, 45)
+btn.Position = UDim2.new(0.8, -10, 0.65, 0)
+btn.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+btn.TextColor3 = Color3.fromRGB(50, 255, 50)
+btn.Text = "Reset Portals (R)"
+btn.TextScaled = true
+btn.Font = Enum.Font.SourceSansBold
+btn.Parent = sg
+
+local corner = Instance.new("UICorner", btn)
+corner.CornerRadius = UDim.new(0, 8)
+
+btn.MouseButton1Click:Connect(resetPortals)
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+	if gpe then return end
+	if input.KeyCode == Enum.KeyCode.R then
+		resetPortals()
+	end
+end)
+
