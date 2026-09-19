@@ -5,12 +5,15 @@ local TweenService = game:GetService("TweenService")
 local CoreGui = game:GetService("CoreGui")
 
 local player = Players.LocalPlayer
-local spawnFlaskModel = nil
-local flaskPosition = nil
-local cloneModel = nil
+local activeFlasks = {}
+local maxFlasks = 3
+local chosenFlaskIndex = nil
+local isRespawningFromFlask = false
+local blockStandardSpawn = false
+local autoSpawnConnection = nil
 
 --------------------------------------------------------------------------------
--- 1. ИНТЕРФЕЙС И ЭКРАН СМЕРТИ (GUI)
+-- 1. ИНТЕРФЕЙС И ТЁМНОЕ НЕПРОЗРАЧНОЕ МЕНЮ
 --------------------------------------------------------------------------------
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "PhoenixProjectGUI"
@@ -22,50 +25,64 @@ if not screenGui.Parent then
 	screenGui.Parent = player:WaitForChild("PlayerGui")
 end
 
+-- Кнопка спавна колбы
 local spawnButton = Instance.new("TextButton")
 spawnButton.Name = "SpawnButton"
--- Подняли кнопку выше (0.52 вместо 0.65)
 spawnButton.Size = UDim2.new(0, 160, 0, 50)
 spawnButton.Position = UDim2.new(0.82, 0, 0.52, 0)
-spawnButton.BackgroundColor3 = Color3.fromRGB(0, 200, 100) -- Зеленый цвет
+spawnButton.BackgroundColor3 = Color3.fromRGB(0, 200, 100)
 spawnButton.Text = "Спавн колбы"
 spawnButton.TextColor3 = Color3.fromRGB(255, 255, 255)
 spawnButton.TextSize = 16
 spawnButton.Font = Enum.Font.GothamBold
 spawnButton.Parent = screenGui
 
-local uiCorner = Instance.new("UICorner")
-uiCorner.CornerRadius = UDim.new(0, 10)
-uiCorner.Parent = spawnButton
+local uiCornerBtn = Instance.new("UICorner")
+uiCornerBtn.CornerRadius = UDim.new(0, 10)
+uiCornerBtn.Parent = spawnButton
 
-local deathScreen = Instance.new("Frame")
-deathScreen.Name = "DeathScreen"
-deathScreen.Size = UDim2.new(1, 0, 1, 0)
-deathScreen.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-deathScreen.BackgroundTransparency = 1 
-deathScreen.ZIndex = 10
-deathScreen.Parent = screenGui
+-- Главный экран меню выбора (абсолютно чёрный непрозрачный фон)
+local selectMenu = Instance.new("Frame")
+selectMenu.Name = "SelectMenu"
+selectMenu.Size = UDim2.new(1, 0, 1, 0)
+selectMenu.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+selectMenu.BackgroundTransparency = 0
+selectMenu.Visible = false
+selectMenu.ZIndex = 50
+selectMenu.Parent = screenGui
 
-local deathText = Instance.new("TextLabel")
-deathText.Name = "DeathText"
-deathText.Size = UDim2.new(1, 0, 0, 100)
-deathText.Position = UDim2.new(0, 0, 0.45, -50)
-deathText.BackgroundTransparency = 1
-deathText.TextColor3 = Color3.fromRGB(255, 255, 255)
-deathText.TextSize = 32
-deathText.Font = Enum.Font.GothamBold
-deathText.TextTransparency = 1
-deathText.Text = "Операция «Феникс»: 3"
-deathText.ZIndex = 11
-deathText.Parent = deathScreen
+local menuTitle = Instance.new("TextLabel")
+menuTitle.Size = UDim2.new(1, 0, 0, 60)
+menuTitle.Position = UDim2.new(0, 0, 0.2, 0)
+menuTitle.BackgroundTransparency = 1
+menuTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+menuTitle.TextSize = 26
+menuTitle.Font = Enum.Font.GothamBold
+menuTitle.Text = "ВЫБЕРИТЕ КАПСУЛУ ДЛЯ ПРОЕКТА «ФЕНИКС»"
+menuTitle.ZIndex = 51
+menuTitle.Parent = selectMenu
+
+local buttonsContainer = Instance.new("Frame")
+buttonsContainer.Size = UDim2.new(0, 500, 0, 100)
+buttonsContainer.Position = UDim2.new(0.5, -250, 0.45, 0)
+buttonsContainer.BackgroundTransparency = 1
+buttonsContainer.ZIndex = 51
+buttonsContainer.Parent = selectMenu
+
+local UIListLayout = Instance.new("UIListLayout")
+UIListLayout.FillDirection = Enum.FillDirection.Horizontal
+UIListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+UIListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+UIListLayout.Padding = UDim.new(0, 20)
+UIListLayout.Parent = buttonsContainer
 
 --------------------------------------------------------------------------------
--- 2. СОЗДАНИЕ КЛОНА
+-- 2. СОЗДАНИЕ КЛОНА ВНУТРИ КОЛБЫ (ПРЕВЬЮ)
 --------------------------------------------------------------------------------
-local function createCloneInsideFlask(pos)
-	if cloneModel then
-		cloneModel:Destroy()
-		cloneModel = nil
+local function createCloneInsideFlask(flaskData)
+	if flaskData.Clone then
+		flaskData.Clone:Destroy()
+		flaskData.Clone = nil
 	end
 
 	task.spawn(function()
@@ -76,7 +93,7 @@ local function createCloneInsideFlask(pos)
 				
 				local root = model:FindFirstChild("HumanoidRootPart")
 				if root then
-					root.CFrame = CFrame.new(pos.X, pos.Y + 3.8, pos.Z)
+					root.CFrame = CFrame.new(flaskData.Position.X, flaskData.Position.Y + 3.8, flaskData.Position.Z)
 					root.Anchored = true
 				end
 
@@ -93,25 +110,26 @@ local function createCloneInsideFlask(pos)
 				end
 
 				model.Parent = Workspace
-				cloneModel = model
+				flaskData.Clone = model
 			end
 		end)
 	end)
 end
 
 --------------------------------------------------------------------------------
--- 3. СОЗДАНИЕ КАПСУЛЫ (КОЛБЫ)
+-- 3. СИСТЕМА СПАВНА КОЛБ (ЯРКО-СИНЯЯ КАПСУЛА)
 --------------------------------------------------------------------------------
 local function createFlask(targetPos)
-	if spawnFlaskModel then
-		spawnFlaskModel:Destroy()
-		spawnFlaskModel = nil
+	if #activeFlasks >= maxFlasks then
+		local oldFlask = table.remove(activeFlasks, 1)
+		if oldFlask then
+			if oldFlask.Model then oldFlask.Model:Destroy() end
+			if oldFlask.Clone then oldFlask.Clone:Destroy() end
+		end
 	end
 
-	flaskPosition = targetPos
-
 	local flask = Instance.new("Model")
-	flask.Name = "RickFlask"
+	flask.Name = "PhoenixFlask"
 	flask.Parent = Workspace
 
 	local rot = CFrame.Angles(0, 0, math.rad(90))
@@ -134,7 +152,7 @@ local function createFlask(targetPos)
 	ring1.CFrame = CFrame.new(targetPos + Vector3.new(0, 1.3, 0)) * rot
 	ring1.Anchored = true
 	ring1.CanCollide = true
-	ring1.BrickColor = BrickColor.new("Black")
+	ring1.BrickColor = BrickColor.new("Deep blue")
 	ring1.Material = Enum.Material.SmoothPlastic
 	ring1.Parent = flask
 
@@ -145,8 +163,8 @@ local function createFlask(targetPos)
 	glass.CFrame = CFrame.new(targetPos + Vector3.new(0, 4.8, 0)) * rot
 	glass.Anchored = true
 	glass.CanCollide = false
-	glass.Transparency = 0.25
-	glass.BrickColor = BrickColor.new("Mint")
+	glass.Transparency = 0.3
+	glass.BrickColor = BrickColor.new("Cyan")
 	glass.Material = Enum.Material.Glass
 	glass.Parent = flask
 
@@ -157,14 +175,14 @@ local function createFlask(targetPos)
 	liquid.CFrame = CFrame.new(targetPos + Vector3.new(0, 4.5, 0)) * rot
 	liquid.Anchored = true
 	liquid.CanCollide = false
-	liquid.Transparency = 0.15
-	liquid.BrickColor = BrickColor.new("Lime green")
+	liquid.Transparency = 0.2
+	liquid.BrickColor = BrickColor.new("Medium blue")
 	liquid.Material = Enum.Material.Neon
 	liquid.Parent = flask
 
 	local bubbles = Instance.new("ParticleEmitter")
 	bubbles.Name = "Bubbles"
-	bubbles.Color = ColorSequence.new(Color3.fromRGB(150, 255, 50))
+	bubbles.Color = ColorSequence.new(Color3.fromRGB(100, 200, 255))
 	bubbles.Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.3), NumberSequenceKeypoint.new(1, 0.05)})
 	bubbles.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 1)})
 	bubbles.Lifetime = NumberRange.new(0.8, 1.5)
@@ -175,9 +193,9 @@ local function createFlask(targetPos)
 
 	local flaskLight = Instance.new("PointLight")
 	flaskLight.Name = "FlaskLight"
-	flaskLight.Color = Color3.fromRGB(50, 255, 50)
-	flaskLight.Brightness = 5
-	flaskLight.Range = 18
+	flaskLight.Color = Color3.fromRGB(0, 150, 255)
+	flaskLight.Brightness = 6
+	flaskLight.Range = 20
 	flaskLight.Parent = liquid
 
 	local ring2 = Instance.new("Part")
@@ -187,7 +205,7 @@ local function createFlask(targetPos)
 	ring2.CFrame = CFrame.new(targetPos + Vector3.new(0, 8.3, 0)) * rot
 	ring2.Anchored = true
 	ring2.CanCollide = false
-	ring2.BrickColor = BrickColor.new("Black")
+	ring2.BrickColor = BrickColor.new("Deep blue")
 	ring2.Material = Enum.Material.SmoothPlastic
 	ring2.Parent = flask
 
@@ -208,8 +226,14 @@ local function createFlask(targetPos)
 	hissSound.Volume = 4
 	hissSound.Parent = base
 
-	spawnFlaskModel = flask
-	createCloneInsideFlask(targetPos)
+	local flaskData = {
+		Model = flask,
+		Position = targetPos,
+		Clone = nil
+	}
+
+	table.insert(activeFlasks, flaskData)
+	createCloneInsideFlask(flaskData)
 end
 
 spawnButton.MouseButton1Click:Connect(function()
@@ -220,133 +244,202 @@ spawnButton.MouseButton1Click:Connect(function()
 end)
 
 --------------------------------------------------------------------------------
--- 4. ЛОГИКА СМЕРТИ И РЕСПАУНА
+-- 4. ОБРАБОТКА СМЕРТИ И АВТО-ВЫБОР РАНДОМНОЙ КАПСУЛЫ ЧЕРЕЗ 3 СЕКУНДЫ
 --------------------------------------------------------------------------------
+local function cancelAutoSpawnTimer()
+	if autoSpawnConnection then
+		task.cancel(autoSpawnConnection)
+		autoSpawnConnection = nil
+	end
+end
+
+local function updateMenuButtons()
+	for _, child in ipairs(buttonsContainer:GetChildren()) do
+		if child:IsA("TextButton") then
+			child:Destroy()
+		end
+	end
+
+	for i, flaskData in ipairs(activeFlasks) do
+		local btn = Instance.new("TextButton")
+		btn.Size = UDim2.new(0, 140, 0, 70)
+		btn.BackgroundColor3 = Color3.fromRGB(0, 200, 80) -- Зелёный цвет кнопок
+		btn.Text = "Капсула #" .. i
+		btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+		btn.TextSize = 18
+		btn.Font = Enum.Font.GothamBold
+		btn.ZIndex = 52
+		
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 10)
+		corner.Parent = btn
+
+		btn.MouseButton1Click:Connect(function()
+			cancelAutoSpawnTimer()
+			blockStandardSpawn = false
+			chosenFlaskIndex = i
+			isRespawningFromFlask = true
+			selectMenu.Visible = false
+
+			player:LoadCharacter()
+		end)
+
+		btn.Parent = buttonsContainer
+	end
+end
+
 local function setupCharacter(char)
 	local humanoid = char:WaitForChild("Humanoid")
 	
 	humanoid.Died:Connect(function()
-		if not spawnFlaskModel or not spawnFlaskModel:FindFirstChild("Base") then return end
-
-		deathScreen.BackgroundTransparency = 0
-		deathText.TextTransparency = 0
-
-		for i = 3, 1, -1 do
-            deathText.Text = "Активация клона: " .. i
-			task.wait(1)
+		if #activeFlasks == 0 then
+			selectMenu.Visible = false
+			blockStandardSpawn = false
+			return
 		end
 
-		deathText.Text = "Операция «Феникс»!"
-		player:LoadCharacter()
+		isRespawningFromFlask = false
+		blockStandardSpawn = true
+		updateMenuButtons()
+		selectMenu.Visible = true
+
+		-- Таймер авто-выбора рандомной капсулы через 3 секунды
+		cancelAutoSpawnTimer()
+		autoSpawnConnection = task.delay(3, function()
+			if selectMenu.Visible and #activeFlasks > 0 then
+				local randomIndex = math.random(1, #activeFlasks)
+				chosenFlaskIndex = randomIndex
+				isRespawningFromFlask = true
+				selectMenu.Visible = false
+				blockStandardSpawn = false
+				player:LoadCharacter()
+			end
+		end)
 	end)
 end
 
 Players.LocalPlayer.CharacterAdded:Connect(function(newChar)
+	cancelAutoSpawnTimer()
 	local humanoid = newChar:WaitForChild("Humanoid")
 	local rootPart = newChar:WaitForChild("HumanoidRootPart")
 
-	if cloneModel then
-		cloneModel:Destroy()
-		cloneModel = nil
+	if blockStandardSpawn and not isRespawningFromFlask then
+		selectMenu.Visible = false
+		blockStandardSpawn = false
+		setupCharacter(newChar)
+		return
 	end
 
-	if spawnFlaskModel and spawnFlaskModel:FindFirstChild("Base") then
-		local base = spawnFlaskModel.Base
-		local glass = spawnFlaskModel:FindFirstChild("Glass")
-		local liquid = spawnFlaskModel:FindFirstChild("Liquid")
-		local topCap = spawnFlaskModel:FindFirstChild("TopCap")
-		local ring1 = spawnFlaskModel:FindFirstChild("Ring1")
-		local ring2 = spawnFlaskModel:FindFirstChild("Ring2")
-		local hiss = base:FindFirstChild("HissSound")
-		local light = liquid:FindFirstChild("FlaskLight")
+	if not isRespawningFromFlask then
+		selectMenu.Visible = false
+		setupCharacter(newChar)
+		return
+	end
 
-		rootPart.CFrame = CFrame.new(flaskPosition.X, flaskPosition.Y + 3.8, flaskPosition.Z)
-		rootPart.Anchored = true
-		humanoid.WalkSpeed = 0
-		humanoid.JumpPower = 0
-
-		local smoke = Instance.new("ParticleEmitter")
-		smoke.Name = "PhoenixSmoke"
-		smoke.Color = ColorSequence.new(Color3.fromRGB(180, 255, 150))
-		smoke.Size = NumberSequence.new({
-			NumberSequenceKeypoint.new(0, 1), 
-			NumberSequenceKeypoint.new(0.4, 5.5), 
-			NumberSequenceKeypoint.new(1, 13)
-		})
-		smoke.Transparency = NumberSequence.new({
-			NumberSequenceKeypoint.new(0, 0.05), 
-			NumberSequenceKeypoint.new(0.5, 0.25), 
-			NumberSequenceKeypoint.new(1, 1)
-		})
-		smoke.Lifetime = NumberRange.new(3, 4.5)
-		smoke.Rate = 200
-		smoke.Speed = NumberRange.new(2, 7)
-		smoke.Parent = base
-
-		if hiss then hiss:Play() end
-
-		task.wait(0.6)
-
-		TweenService:Create(deathScreen, TweenInfo.new(0.6), {BackgroundTransparency = 1}):Play()
-		TweenService:Create(deathText, TweenInfo.new(0.6), {TextTransparency = 1}):Play()
-
-		if light then
-			TweenService:Create(light, TweenInfo.new(0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.Out, 3, true), {Brightness = 8}):Play()
-		end
-
-		local openInfo = TweenInfo.new(1.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-		if glass and topCap and liquid then
-			if ring1 then TweenService:Create(ring1, openInfo, {CFrame = ring1.CFrame + Vector3.new(0, 9.5, 0), Transparency = 1}):Play() end
-			if ring2 then TweenService:Create(ring2, openInfo, {CFrame = ring2.CFrame + Vector3.new(0, 9.5, 0), Transparency = 1}):Play() end
-			TweenService:Create(glass, openInfo, {CFrame = glass.CFrame + Vector3.new(0, 9.5, 0), Transparency = 1}):Play()
-			TweenService:Create(topCap, openInfo, {CFrame = topCap.CFrame + Vector3.new(0, 9.5, 0)}):Play()
-			TweenService:Create(liquid, openInfo, {Transparency = 1}):Play()
-			
-			local bub = liquid:FindFirstChild("Bubbles")
-			if bub then bub.Enabled = false end
-			
-			if light then TweenService:Create(light, TweenInfo.new(1), {Brightness = 0}):Play() end
-		end
-
-		task.wait(1.5)
-		rootPart.Anchored = false
-
-		task.wait(1.3)
-		if hiss then
-			local fadeSound = TweenService:Create(hiss, TweenInfo.new(1.2), {Volume = 0})
-			fadeSound:Play()
-			fadeSound.Completed:Wait()
-			hiss:Stop()
-			hiss.Volume = 4
-		end
+	if activeFlasks[chosenFlaskIndex] then
+		local flaskData = activeFlasks[chosenFlaskIndex]
 		
-		smoke:Destroy()
-		humanoid.WalkSpeed = 16
-		humanoid.JumpPower = 50
+		if flaskData.Clone then
+			flaskData.Clone:Destroy()
+			flaskData.Clone = nil
+		end
 
-		task.delay(4, function()
-			if spawnFlaskModel and glass and topCap and liquid then
-				local closeInfo = TweenInfo.new(1.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
-				local rot = CFrame.Angles(0, 0, math.rad(90))
-				
-				if ring1 then TweenService:Create(ring1, closeInfo, {CFrame = CFrame.new(flaskPosition + Vector3.new(0, 1.3, 0)) * rot, Transparency = 0}):Play() end
-				if ring2 then TweenService:Create(ring2, closeInfo, {CFrame = CFrame.new(flaskPosition + Vector3.new(0, 8.3, 0)) * rot, Transparency = 0}):Play() end
+		local flaskModel = flaskData.Model
+		local flaskPos = flaskData.Position
 
-				TweenService:Create(glass, closeInfo, {CFrame = CFrame.new(flaskPosition + Vector3.new(0, 4.8, 0)) * rot, Transparency = 0.25}):Play()
-				TweenService:Create(topCap, closeInfo, {CFrame = CFrame.new(flaskPosition + Vector3.new(0, 9.4, 0)) * rot}):Play()
-				TweenService:Create(liquid, closeInfo, {Transparency = 0.15}):Play()
-				
-				local bub = liquid:FindFirstChild("Bubbles")
-				if bub then bub.Enabled = true end
-				
-				if light then light.Brightness = 5 end
+		if flaskModel and flaskModel:FindFirstChild("Base") then
+			local base = flaskModel.Base
+			local glass = flaskModel:FindFirstChild("Glass")
+			local liquid = flaskModel:FindFirstChild("Liquid")
+			local topCap = flaskModel:FindFirstChild("TopCap")
+			local ring1 = flaskModel:FindFirstChild("Ring1")
+			local ring2 = flaskModel:FindFirstChild("Ring2")
+			local hiss = base:FindFirstChild("HissSound")
+			local light = liquid:FindFirstChild("FlaskLight")
 
-				createCloneInsideFlask(flaskPosition)
-			end
-		end)
-	else
-		TweenService:Create(deathScreen, TweenInfo.new(0.4), {BackgroundTransparency = 1}):Play()
-		TweenService:Create(deathText, TweenInfo.new(0.4), {TextTransparency = 1}):Play()
+			rootPart.CFrame = CFrame.new(flaskPos.X, flaskPos.Y + 3.8, flaskPos.Z)
+			rootPart.Anchored = true
+			humanoid.WalkSpeed = 0
+			humanoid.JumpPower = 0
+
+			local smoke = Instance.new("ParticleEmitter")
+			smoke.Name = "PhoenixSmoke"
+			smoke.Color = ColorSequence.new(Color3.fromRGB(100, 200, 255))
+			smoke.Size = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 1), 
+				NumberSequenceKeypoint.new(0.4, 5.5), 
+				NumberSequenceKeypoint.new(1, 13)
+			})
+			smoke.Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 0.05), 
+				NumberSequenceKeypoint.new(0.5, 0.25), 
+				NumberSequenceKeypoint.new(1, 1)
+			})
+			smoke.Lifetime = NumberRange.new(3, 4.5)
+			smoke.Rate = 200
+			smoke.Speed = NumberRange.new(2, 7)
+			smoke.Parent = base
+
+			if hiss then hiss:Play() end
+
+			task.spawn(function()
+				if light then
+					TweenService:Create(light, TweenInfo.new(0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.Out, 3, true), {Brightness = 10}):Play()
+				end
+
+				local openInfo = TweenInfo.new(1.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+				if glass and topCap and liquid then
+					if ring1 then TweenService:Create(ring1, openInfo, {CFrame = ring1.CFrame + Vector3.new(0, 9.5, 0), Transparency = 1}):Play() end
+					if ring2 then TweenService:Create(ring2, openInfo, {CFrame = ring2.CFrame + Vector3.new(0, 9.5, 0), Transparency = 1}):Play() end
+					TweenService:Create(glass, openInfo, {CFrame = glass.CFrame + Vector3.new(0, 9.5, 0), Transparency = 1}):Play()
+					TweenService:Create(topCap, openInfo, {CFrame = topCap.CFrame + Vector3.new(0, 9.5, 0)}):Play()
+					TweenService:Create(liquid, openInfo, {Transparency = 1}):Play()
+					
+					local bub = liquid:FindFirstChild("Bubbles")
+					if bub then bub.Enabled = false end
+					
+					if light then TweenService:Create(light, TweenInfo.new(1), {Brightness = 0}):Play() end
+				end
+
+				task.wait(1.5)
+				rootPart.Anchored = false
+
+				task.wait(1.3)
+				if hiss then
+					local fadeSound = TweenService:Create(hiss, TweenInfo.new(1.2), {Volume = 0})
+					fadeSound:Play()
+					fadeSound.Completed:Wait()
+					hiss:Stop()
+					hiss.Volume = 4
+				end
+				
+				smoke:Destroy()
+				humanoid.WalkSpeed = 16
+				humanoid.JumpPower = 50
+
+				task.delay(4, function()
+					if flaskModel and glass and topCap and liquid then
+						local closeInfo = TweenInfo.new(1.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+						local rot = CFrame.Angles(0, 0, math.rad(90))
+						
+						if ring1 then TweenService:Create(ring1, closeInfo, {CFrame = CFrame.new(flaskPos + Vector3.new(0, 1.3, 0)) * rot, Transparency = 0}):Play() end
+						if ring2 then TweenService:Create(ring2, closeInfo, {CFrame = CFrame.new(flaskPos + Vector3.new(0, 8.3, 0)) * rot, Transparency = 0}):Play() end
+
+						TweenService:Create(glass, closeInfo, {CFrame = CFrame.new(flaskPos + Vector3.new(0, 4.8, 0)) * rot, Transparency = 0.3}):Play()
+						TweenService:Create(topCap, closeInfo, {CFrame = CFrame.new(flaskPos + Vector3.new(0, 9.4, 0)) * rot}):Play()
+						TweenService:Create(liquid, closeInfo, {Transparency = 0.2}):Play()
+						
+						local bub = liquid:FindFirstChild("Bubbles")
+						if bub then bub.Enabled = true end
+						
+						if light then light.Brightness = 6 end
+
+						createCloneInsideFlask(flaskData)
+					end
+				end)
+			end)
+		end
+		isRespawningFromFlask = false
 	end
 
 	setupCharacter(newChar)
@@ -355,4 +448,5 @@ end)
 if player.Character then
 	setupCharacter(player.Character)
 end
+
 
