@@ -1,0 +1,490 @@
+-- Rick & Morty Portal Gun (обычный звук выстрела, быстрый вход, замедленный выход)
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local TweenService = game:GetService("TweenService")
+local Lighting = game:GetService("Lighting")
+local RunService = game:GetService("RunService")
+
+local LocalPlayer = Players.LocalPlayer
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- 1. ЭФФЕКТЫ И ЭКРАН
+local flashGui = Instance.new("ScreenGui")
+flashGui.Name = "PortalFXGui"
+flashGui.ResetOnSpawn = false
+flashGui.IgnoreGuiInset = true
+flashGui.Parent = playerGui
+
+local flashFrame = Instance.new("Frame")
+flashFrame.Size = UDim2.new(1, 0, 1, 0)
+flashFrame.BackgroundColor3 = Color3.fromRGB(40, 220, 70)
+flashFrame.BackgroundTransparency = 1
+flashFrame.BorderSizePixel = 0
+flashFrame.Parent = flashGui
+
+local portalBlur = Instance.new("BlurEffect")
+portalBlur.Size = 0
+portalBlur.Enabled = true
+portalBlur.Parent = Lighting
+
+local function playSoundSafe(id, volume, pitch, parent)
+	local s = Instance.new("Sound")
+	s.SoundId = "rbxassetid://" .. tostring(id)
+	s.Volume = volume or 1
+	s.Pitch = pitch or 1
+	s.Parent = parent or Workspace
+	
+	task.spawn(function()
+		local success = pcall(function() s:Play() end)
+		if success then
+			s.Ended:Wait()
+		end
+		s:Destroy()
+	end)
+end
+
+-- Эффект при входе/выходе (быстрый вход, замедленный плавный выход)
+local function playPortalScreenEffect()
+	-- Звук телепортации (оригинальный из Рик и Морти)
+	playSoundSafe(756847338, 1.2, 1.0)
+	
+	-- Быстрое появление зелёной пелены при входе (0.12 сек)
+	flashFrame.BackgroundTransparency = 1
+	local tweenIn = TweenService:Create(flashFrame, TweenInfo.new(0.12, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {BackgroundTransparency = 0.25})
+	local blurIn = TweenService:Create(portalBlur, TweenInfo.new(0.12, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {Size = 28})
+	
+	tweenIn:Play()
+	blurIn:Play()
+	
+	-- Долгое, замедленное и плавное затухание при выходе (1.1 секунды)
+	task.delay(0.15, function()
+		local tweenOut = TweenService:Create(flashFrame, TweenInfo.new(1.1, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {BackgroundTransparency = 1})
+		local blurOut = TweenService:Create(portalBlur, TweenInfo.new(1.1, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out), {Size = 0})
+		tweenOut:Play()
+		blurOut:Play()
+	end)
+end
+
+-- 2. ЛУЧ ВЫСТРЕЛА
+local function drawLaserBeam(startPos, endPos)
+	local distance = (startPos - endPos).Magnitude
+	local beam = Instance.new("Part")
+	beam.Size = Vector3.new(0.2, 0.2, distance)
+	beam.Material = Enum.Material.Neon
+	beam.Color = Color3.fromRGB(80, 255, 80)
+	beam.Anchored = true
+	beam.CanCollide = false
+	beam.CFrame = CFrame.new(startPos:Lerp(endPos, 0.5), endPos)
+	beam.Parent = workspace
+
+	local tween = TweenService:Create(beam, TweenInfo.new(0.25), {
+		Transparency = 1,
+		Size = Vector3.new(0.01, 0.01, distance)
+	})
+	tween:Play()
+	tween.Completed:Connect(function() beam:Destroy() end)
+end
+
+-- 3. СОЗДАНИЕ ПОРТАЛА
+local portal1 = nil
+local portal2 = nil
+local currentPortalIndex = 1
+local isTeleporting = false
+
+local function createPortalFX()
+	local pModel = Instance.new("Model")
+
+	local base = Instance.new("Part")
+	base.Name = "PortalBase"
+	base.Shape = Enum.PartType.Cylinder
+	base.Size = Vector3.new(0.08, 6.8, 6.8)
+	base.Anchored = true
+	base.CanCollide = false
+	base.Material = Enum.Material.Neon
+	base.Color = Color3.fromRGB(60, 255, 60)
+	base.Transparency = 0.15
+	base.Parent = pModel
+
+	local outerRing = Instance.new("Part")
+	outerRing.Name = "OuterRing"
+	outerRing.Shape = Enum.PartType.Cylinder
+	outerRing.Size = Vector3.new(0.05, 7.4, 7.4)
+	outerRing.Anchored = true
+	outerRing.CanCollide = false
+	outerRing.Material = Enum.Material.Neon
+	outerRing.Color = Color3.fromRGB(120, 255, 60)
+	outerRing.Transparency = 0.3
+	outerRing.CFrame = base.CFrame
+	outerRing.Parent = pModel
+
+	local pe = Instance.new("ParticleEmitter")
+	pe.Texture = "rbxassetid://243664672"
+	pe.Color = ColorSequence.new(Color3.fromRGB(80, 255, 80))
+	pe.Size = NumberSequence.new({NumberSequenceKeypoint.new(0, 2), NumberSequenceKeypoint.new(1, 6)})
+	pe.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.2), NumberSequenceKeypoint.new(1, 1)})
+	pe.Lifetime = NumberRange.new(0.5, 1)
+	pe.Rate = 25
+	pe.Speed = NumberRange.new(1, 3)
+	pe.RotSpeed = NumberRange.new(100, 300)
+	pe.Parent = base
+
+	playSoundSafe(756847338, 0.5, 1.0, base)
+
+	pModel.PrimaryPart = base
+	return pModel
+end
+
+local function resetPortals()
+	if portal1 then portal1:Destroy() portal1 = nil end
+	if portal2 then portal2:Destroy() portal2 = nil end
+	currentPortalIndex = 1
+end
+
+-- ТЕЛЕПОРТАЦИЯ С ПРЫЖКОМ
+local function setupTeleport(srcModel, tgtModel)
+	if not srcModel or not tgtModel then return end
+	local src = srcModel.PrimaryPart
+	local tgt = tgtModel.PrimaryPart
+
+	src.Touched:Connect(function(hit)
+		if isTeleporting or not tgt or not tgt.Parent then return end
+		local char = hit.Parent
+		if not char or char ~= LocalPlayer.Character then return end
+		
+		local root = char:FindFirstChild("HumanoidRootPart")
+		local hum = char:FindFirstChildOfClass("Humanoid")
+
+		if hum and root and hum.Health > 0 then
+			isTeleporting = true
+			playPortalScreenEffect()
+
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+
+			local normal = tgt.CFrame.RightVector
+			local isFloor = math.abs(normal.Y) > 0.6
+			
+			local targetPos
+			local forwardDir
+
+			if isFloor then
+				targetPos = tgt.Position + Vector3.new(0, 2, 0)
+				local currentLook = root.CFrame.LookVector
+				forwardDir = Vector3.new(currentLook.X, 0, currentLook.Z)
+				if forwardDir.Magnitude < 0.1 then forwardDir = Vector3.new(0, 0, -1) else forwardDir = forwardDir.Unit end
+			else
+				targetPos = tgt.Position + (normal * 2.5) + Vector3.new(0, 0.5, 0)
+				forwardDir = Vector3.new(normal.X, 0, normal.Z)
+				if forwardDir.Magnitude < 0.1 then forwardDir = Vector3.new(0, 0, -1) else forwardDir = forwardDir.Unit end
+			end
+
+			char:PivotTo(CFrame.lookAt(targetPos, targetPos + forwardDir))
+
+			task.defer(function()
+				task.wait()
+				if hum and hum.Health > 0 then
+					hum.Jump = true
+				end
+			end)
+
+			task.wait(0.3)
+			isTeleporting = false
+		end
+	end)
+end
+
+-- 4. СБОРКА ПУШКИ (12 ШАРИКОВ В КУПОЛЕ)
+local function buildPortalGun()
+	local portalGun = Instance.new("Tool")
+	portalGun.Name = "Portal gun jr"
+	portalGun.RequiresHandle = true
+	portalGun.CanBeDropped = false
+
+	portalGun.Grip = CFrame.new(0, -0.3, 0.3)
+
+	local handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Size = Vector3.new(0.85, 0.5, 1.6)
+	handle.Transparency = 1
+	handle.CanCollide = false
+	handle.Parent = portalGun
+
+	local gunModel = Instance.new("Model")
+	gunModel.Name = "RickPortalGunModel"
+	gunModel.Parent = portalGun
+
+	local function attach(part, offsetCFrame)
+		part.CanCollide = false
+		part.Massless = true
+		part.CFrame = handle.CFrame * offsetCFrame
+		part.Parent = gunModel
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0 = handle
+		weld.Part1 = part
+		weld.Parent = handle
+	end
+
+	local body = Instance.new("Part")
+	body.Size = Vector3.new(0.85, 0.5, 1.6)
+	body.Color = Color3.fromRGB(220, 222, 228)
+	body.Material = Enum.Material.SmoothPlastic
+	attach(body, CFrame.new(0, 0, 0))
+
+	local frontFace = Instance.new("Part")
+	frontFace.Size = Vector3.new(0.83, 0.45, 0.06)
+	frontFace.Color = Color3.fromRGB(180, 185, 195)
+	frontFace.Material = Enum.Material.SmoothPlastic
+	attach(frontFace, CFrame.new(0, 0.05, -0.81) * CFrame.Angles(math.rad(25), 0, 0))
+
+	local grip = Instance.new("Part")
+	grip.Shape = Enum.PartType.Cylinder
+	grip.Size = Vector3.new(0.65, 0.38, 0.38)
+	grip.Color = Color3.fromRGB(30, 120, 215)
+	grip.Material = Enum.Material.SmoothPlastic
+	attach(grip, CFrame.new(0, -0.38, 0.3) * CFrame.Angles(0, 0, math.rad(90)) * CFrame.Angles(math.rad(-12), 0, 0))
+
+	local shootPoint = Instance.new("Part")
+	shootPoint.Name = "ShootPoint"
+	shootPoint.Size = Vector3.new(0.1, 0.1, 0.1)
+	shootPoint.Transparency = 1
+	attach(shootPoint, CFrame.new(0, 0.05, -0.9))
+
+	local clownNose = Instance.new("Part")
+	clownNose.Shape = Enum.PartType.Ball
+	clownNose.Size = Vector3.new(0.22, 0.22, 0.22)
+	clownNose.Color = Color3.fromRGB(235, 30, 30)
+	clownNose.Material = Enum.Material.SmoothPlastic
+	attach(clownNose, CFrame.new(0, -0.04, -0.85) * CFrame.Angles(math.rad(25), 0, 0))
+
+	local eyeLeftBase = Instance.new("Part")
+	eyeLeftBase.Shape = Enum.PartType.Cylinder
+	eyeLeftBase.Size = Vector3.new(0.08, 0.18, 0.18)
+	eyeLeftBase.Color = Color3.fromRGB(100, 105, 115)
+	eyeLeftBase.Material = Enum.Material.Metal
+	attach(eyeLeftBase, CFrame.new(-0.24, 0.14, -0.85) * CFrame.Angles(math.rad(25), math.rad(90), 0))
+
+	local eyeLeftLens = Instance.new("Part")
+	eyeLeftLens.Shape = Enum.PartType.Cylinder
+	eyeLeftLens.Size = Vector3.new(0.09, 0.12, 0.12)
+	eyeLeftLens.Color = Color3.fromRGB(80, 220, 255)
+	eyeLeftLens.Material = Enum.Material.Neon
+	attach(eyeLeftLens, CFrame.new(-0.24, 0.14, -0.86) * CFrame.Angles(math.rad(25), math.rad(90), 0))
+
+	local eyeRightBase = Instance.new("Part")
+	eyeRightBase.Shape = Enum.PartType.Cylinder
+	eyeRightBase.Size = Vector3.new(0.08, 0.18, 0.18)
+	eyeRightBase.Color = Color3.fromRGB(100, 105, 115)
+	eyeRightBase.Material = Enum.Material.Metal
+	attach(eyeRightBase, CFrame.new(0.24, 0.14, -0.85) * CFrame.Angles(math.rad(25), math.rad(90), 0))
+
+	local eyeRightLens = Instance.new("Part")
+	eyeRightLens.Shape = Enum.PartType.Cylinder
+	eyeRightLens.Size = Vector3.new(0.09, 0.12, 0.12)
+	eyeRightLens.Color = Color3.fromRGB(80, 220, 255)
+	eyeRightLens.Material = Enum.Material.Neon
+	attach(eyeRightLens, CFrame.new(0.24, 0.14, -0.86) * CFrame.Angles(math.rad(25), math.rad(90), 0))
+
+	local ringBorder = Instance.new("Part")
+	ringBorder.Shape = Enum.PartType.Cylinder
+	ringBorder.Size = Vector3.new(0.05, 0.48, 0.48)
+	ringBorder.Color = Color3.fromRGB(220, 30, 30)
+	ringBorder.Material = Enum.Material.SmoothPlastic
+	attach(ringBorder, CFrame.new(0, 0.27, -0.3) * CFrame.Angles(0, 0, math.rad(90)))
+
+	local glassDome = Instance.new("Part")
+	glassDome.Name = "RickDome"
+	glassDome.Shape = Enum.PartType.Ball
+	glassDome.Size = Vector3.new(0.52, 0.52, 0.52)
+	glassDome.Color = Color3.fromRGB(180, 245, 200)
+	glassDome.Material = Enum.Material.Glass
+	glassDome.Transparency = 0.45
+	attach(glassDome, CFrame.new(0, 0.35, -0.3))
+
+	local bigGreenOrb = Instance.new("Part")
+	bigGreenOrb.Name = "InnerEnergyOrb"
+	bigGreenOrb.Shape = Enum.PartType.Ball
+	bigGreenOrb.Size = Vector3.new(0.28, 0.28, 0.28)
+	bigGreenOrb.Color = Color3.fromRGB(60, 255, 60)
+	bigGreenOrb.Material = Enum.Material.Neon
+	bigGreenOrb.Transparency = 0.15
+	attach(bigGreenOrb, CFrame.new(0, 0.35, -0.3))
+
+	-- Создаем 12 шариков ВНУТРИ стеклянного купола
+	local smallOrbs = {}
+	for i = 1, 12 do
+		local orb = Instance.new("Part")
+		orb.Shape = Enum.PartType.Ball
+		orb.Size = Vector3.new(0.08, 0.08, 0.08)
+		orb.Color = Color3.fromRGB(90, 255, 80)
+		orb.Material = Enum.Material.Neon
+		orb.CanCollide = false
+		orb.Massless = true
+		orb.Parent = gunModel
+		
+		local offset = CFrame.new(
+			(math.random() - 0.5) * 0.18,
+			0.35 + (math.random() - 0.5) * 0.18,
+			-0.3 + (math.random() - 0.5) * 0.18
+		)
+		table.insert(smallOrbs, {
+			Part = orb, 
+			Offset = offset, 
+			Angle = math.random() * math.pi * 2,
+			Speed = math.random(3, 7)
+		})
+	end
+
+	-- Анимация вращения шариков
+	local hbConn
+	hbConn = RunService.RenderStepped:Connect(function(dt)
+		if not portalGun.Parent or not handle.Parent then
+			if hbConn then hbConn:Disconnect() end
+			return
+		end
+		for _, data in ipairs(smallOrbs) do
+			if data.Part and data.Part.Parent then
+				data.Angle = data.Angle + dt * data.Speed
+				local radius = 0.1
+				local xOffset = math.cos(data.Angle) * radius
+				local zOffset = math.sin(data.Angle) * radius
+				data.Part.CFrame = handle.CFrame * (data.Offset + Vector3.new(xOffset, 0, zOffset))
+			end
+		end
+	end)
+
+	local yellowBtn = Instance.new("Part")
+	yellowBtn.Shape = Enum.PartType.Cylinder
+	yellowBtn.Size = Vector3.new(0.08, 0.26, 0.26)
+	yellowBtn.Color = Color3.fromRGB(250, 200, 20)
+	yellowBtn.Material = Enum.Material.SmoothPlastic
+	attach(yellowBtn, CFrame.new(0, 0.28, 0.35) * CFrame.Angles(0, 0, math.rad(90)))
+
+	local backRedPanel = Instance.new("Part")
+	backRedPanel.Size = Vector3.new(0.83, 0.45, 0.05)
+	backRedPanel.Color = Color3.fromRGB(220, 30, 30)
+	backRedPanel.Material = Enum.Material.SmoothPlastic
+	attach(backRedPanel, CFrame.new(0, 0, 0.78))
+
+	local screenDisp = Instance.new("Part")
+	screenDisp.Size = Vector3.new(0.45, 0.24, 0.02)
+	screenDisp.Color = Color3.fromRGB(20, 20, 20)
+	screenDisp.Material = Enum.Material.SmoothPlastic
+	attach(screenDisp, CFrame.new(0, 0.03, 0.80))
+
+	local screenGui = Instance.new("SurfaceGui")
+	screenGui.Face = Enum.NormalId.Back
+	screenGui.Parent = screenDisp
+
+	local screenText = Instance.new("TextLabel")
+	screenText.Size = UDim2.new(1, 0, 1, 0)
+	screenText.BackgroundTransparency = 1
+	screenText.Text = "C-137"
+	screenText.TextColor3 = Color3.fromRGB(50, 255, 50)
+	screenText.TextScaled = true
+	screenText.Font = Enum.Font.Code
+	screenText.Parent = screenGui
+
+	local sticker = Instance.new("Part")
+	sticker.Size = Vector3.new(0.01, 0.28, 0.9)
+	sticker.Color = Color3.fromRGB(150, 230, 150)
+	sticker.Material = Enum.Material.SmoothPlastic
+	attach(sticker, CFrame.new(-0.43, 0.02, 0.0))
+
+	local stickerGui = Instance.new("SurfaceGui")
+	stickerGui.Face = Enum.NormalId.Left
+	stickerGui.Parent = sticker
+
+	local stickerText = Instance.new("TextLabel")
+	stickerText.Size = UDim2.new(0.95, 0, 0.85, 0)
+	stickerText.Position = UDim2.new(0.025, 0, 0.075, 0)
+	stickerText.BackgroundTransparency = 1
+	stickerText.RichText = true
+	stickerText.Text = '<font color="#FFFF00">P</font><font color="#FFA500">o</font><font color="#FF4500">r</font><font color="#FF69B4">t</font><font color="#DA70D6">a</font><font color="#8A2BE2">l</font> <font color="#00FFFF">g</font><font color="#7FFF00">u</font><font color="#FFFF00">n</font> <font color="#FF1493">j</font><font color="#00FF7F">r</font>'
+	stickerText.TextScaled = true
+	stickerText.Font = Enum.Font.FredokaOne
+	stickerText.Parent = stickerGui
+
+	portalGun.Activated:Connect(function()
+		local mouse = LocalPlayer:GetMouse()
+		local ray = Workspace:Raycast(mouse.UnitRay.Origin, mouse.UnitRay.Direction * 500)
+		if not ray then return end
+
+		-- Звук выстрела пушки теперь обычный (без ускорений)
+		playSoundSafe(756847338, 1.2, 1.0)
+
+		local hitPos = ray.Position
+		local normal = ray.Normal
+		drawLaserBeam(shootPoint.Position, hitPos)
+
+		local adjustedPos = hitPos + (normal * 0.05)
+		local portalCFrame = CFrame.lookAt(adjustedPos, adjustedPos + normal) * CFrame.Angles(0, math.rad(90), 0)
+
+		if currentPortalIndex == 1 then
+			if portal1 then portal1:Destroy() end
+			portal1 = createPortalFX()
+			portal1:SetPrimaryPartCFrame(portalCFrame)
+			portal1.Parent = workspace
+
+			setupTeleport(portal1, portal2)
+			if portal2 then setupTeleport(portal2, portal1) end
+			currentPortalIndex = 2
+		else
+			if portal2 then portal2:Destroy() end
+			portal2 = createPortalFX()
+			portal2:SetPrimaryPartCFrame(portalCFrame)
+			portal2.Parent = workspace
+
+			setupTeleport(portal2, portal1)
+			setupTeleport(portal1, portal2)
+			currentPortalIndex = 1
+		end
+	end)
+
+	return portalGun
+end
+
+-- 5. ИНИЦИАЛИЗАЦИЯ
+local currentTool = nil
+local function equipTool()
+	if currentTool and currentTool.Parent then currentTool:Destroy() end
+	local backpack = LocalPlayer:WaitForChild("Backpack")
+	currentTool = buildPortalGun()
+	currentTool.Parent = backpack
+end
+
+equipTool()
+LocalPlayer.CharacterAdded:Connect(function()
+	task.wait(0.5)
+	equipTool()
+end)
+
+local sg = playerGui:FindFirstChild("PortalGunUI")
+if not sg then
+	sg = Instance.new("ScreenGui")
+	sg.Name = "PortalGunUI"
+	sg.ResetOnSpawn = false
+	sg.Parent = playerGui
+
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(0, 140, 0, 45)
+	btn.Position = UDim2.new(0.8, -10, 0.65, 0)
+	btn.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+	btn.TextColor3 = Color3.fromRGB(50, 255, 50)
+	btn.Text = "Reset Portals (R)"
+	btn.TextScaled = true
+	btn.Font = Enum.Font.SourceSansBold
+	btn.Parent = sg
+
+	local corner = Instance.new("UICorner", btn)
+	corner.CornerRadius = UDim.new(0, 8)
+
+	btn.MouseButton1Click:Connect(resetPortals)
+end
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+	if gpe then return end
+	if input.KeyCode == Enum.KeyCode.R then
+		resetPortals()
+	end
+end)
