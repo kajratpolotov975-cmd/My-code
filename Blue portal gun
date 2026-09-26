@@ -1,0 +1,301 @@
+-- Delta Portal Gun: Финальный вариант с твоим любимым звуком портала
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local TweenService = game:GetService("TweenService")
+local Lighting = game:GetService("Lighting")
+
+local LocalPlayer = Players.LocalPlayer
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local PORTAL_SOUND_ID = 756847338  -- Твой любимый звук портала
+local STARTUP_SOUND_ID = 9114221371 -- Звук при взятии пушки
+
+local hasPlayedStartupVoice = false
+
+-- Экранные эффекты
+local flashGui = playerGui:FindFirstChild("PortalFXGui")
+if not flashGui then
+	flashGui = Instance.new("ScreenGui")
+	flashGui.Name = "PortalFXGui"
+	flashGui.ResetOnSpawn = false
+	flashGui.IgnoreGuiInset = true
+	flashGui.Parent = playerGui
+end
+
+local flashFrame = flashGui:FindFirstChild("FlashFrame") or Instance.new("Frame")
+flashFrame.Name = "FlashFrame"
+flashFrame.Size = UDim2.new(1, 0, 1, 0)
+flashFrame.BackgroundColor3 = Color3.fromRGB(40, 180, 255)
+flashFrame.BackgroundTransparency = 1
+flashFrame.BorderSizePixel = 0
+flashFrame.Parent = flashGui
+
+local portalBlur = Lighting:FindFirstChild("PortalBlur") or Instance.new("BlurEffect")
+portalBlur.Name = "PortalBlur"
+portalBlur.Size = 0
+portalBlur.Enabled = true
+portalBlur.Parent = Lighting
+
+local function playSoundSafe(id, volume, pitch, parent)
+	local s = Instance.new("Sound")
+	s.SoundId = "rbxassetid://" .. tostring(id)
+	s.Volume = volume or 2
+	s.Pitch = pitch or 1
+	s.Parent = parent or Workspace
+	task.spawn(function()
+		pcall(function() s:Play() end)
+		s.Ended:Wait()
+		s:Destroy()
+	end)
+end
+
+local function playPortalScreenEffect()
+	playSoundSafe(PORTAL_SOUND_ID, 2, 1)
+	flashFrame.BackgroundTransparency = 0.35
+	TweenService:Create(flashFrame, TweenInfo.new(0.3), {BackgroundTransparency = 1}):Play()
+	portalBlur.Size = 14
+	TweenService:Create(portalBlur, TweenInfo.new(0.3), {Size = 0}):Play()
+end
+
+local function drawLaserBeam(startPos, endPos)
+	local distance = (startPos - endPos).Magnitude
+	local beam = Instance.new("Part")
+	beam.Size = Vector3.new(0.15, 0.15, distance)
+	beam.Material = Enum.Material.Neon
+	beam.Color = Color3.fromRGB(40, 180, 255)
+	beam.Anchored = true
+	beam.CanCollide = false
+	beam.CFrame = CFrame.new(startPos:Lerp(endPos, 0.5), endPos)
+	beam.Parent = workspace
+
+	local tween = TweenService:Create(beam, TweenInfo.new(0.2), {
+		Transparency = 1,
+		Size = Vector3.new(0.01, 0.01, distance)
+	})
+	tween:Play()
+	tween.Completed:Connect(function() beam:Destroy() end)
+end
+
+local function createPortalFX(cframe)
+	local pModel = Instance.new("Model")
+	pModel.Name = "PortalModel"
+
+	local base = Instance.new("Part")
+	base.Name = "PortalBase"
+	base.Shape = Enum.PartType.Cylinder
+	base.Size = Vector3.new(0.1, 5.5, 5.5)
+	base.Anchored = true
+	base.CanCollide = false
+	base.Material = Enum.Material.Neon
+	base.Color = Color3.fromRGB(40, 180, 255)
+	base.Transparency = 0.15
+	base.CFrame = cframe
+	base.Parent = pModel
+
+	pModel.PrimaryPart = base
+	pModel.Parent = Workspace
+	playSoundSafe(PORTAL_SOUND_ID, 2, 1, base)
+
+	return pModel
+end
+
+local portal1, portal2 = nil, nil
+local currentPortalIndex = 1
+local isTeleporting = false
+
+local function resetPortals()
+	if portal1 then portal1:Destroy() portal1 = nil end
+	if portal2 then portal2:Destroy() portal2 = nil end
+	currentPortalIndex = 1
+end
+
+local function setupTeleport(srcModel, tgtModel)
+	if not srcModel or not tgtModel then return end
+	local src = srcModel.PrimaryPart
+
+	src.Touched:Connect(function(hit)
+		if isTeleporting or not tgtModel.PrimaryPart or not tgtModel.PrimaryPart.Parent then return end
+		local char = hit.Parent
+		if not char or char ~= LocalPlayer.Character then return end
+		
+		local root = char:FindFirstChild("HumanoidRootPart")
+		local hum = char:FindFirstChildOfClass("Humanoid")
+
+		if hum and root and hum.Health > 0 then
+			isTeleporting = true
+			playPortalScreenEffect()
+			root.AssemblyLinearVelocity = Vector3.zero
+			root.AssemblyAngularVelocity = Vector3.zero
+
+			local tgt = tgtModel.PrimaryPart
+			local normal = tgt.CFrame.RightVector
+			local isFloor = math.abs(normal.Y) > 0.6
+			
+			local targetPos = isFloor and (tgt.Position + Vector3.new(0, 2, 0)) or (tgt.Position + (normal * 2.2) + Vector3.new(0, 0.4, 0))
+			local forwardDir = isFloor and root.CFrame.LookVector or Vector3.new(normal.X, 0, normal.Z)
+			forwardDir = Vector3.new(forwardDir.X, 0, forwardDir.Z)
+			if forwardDir.Magnitude < 0.1 then forwardDir = Vector3.new(0, 0, -1) else forwardDir = forwardDir.Unit end
+
+			char:PivotTo(CFrame.lookAt(targetPos, targetPos + forwardDir))
+			hum.Jump = true
+
+			task.wait(0.35)
+			isTeleporting = false
+		end
+	end)
+end
+
+-- СБОРКА ПУШКИ
+local function buildPortalGun()
+	local tool = Instance.new("Tool")
+	tool.Name = "Portal Gun"
+	tool.RequiresHandle = true
+	tool.CanBeDropped = false
+	tool.Grip = CFrame.new(0, -0.3, 0.5) * CFrame.Angles(math.rad(-5), 0, 0)
+
+	local handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Size = Vector3.new(1, 0.4, 2)
+	handle.Transparency = 1 
+	handle.CanCollide = false
+	handle.Parent = tool
+
+	local function addPart(size, color, material, offset, shape, transparency, rotation)
+		local p = Instance.new("Part")
+		p.Size = size
+		p.Color = color
+		p.Material = material or Enum.Material.SmoothPlastic
+		p.Shape = shape or Enum.PartType.Block
+		p.Transparency = transparency or 0
+		p.CanCollide = false
+		p.Massless = true
+		
+		p.CFrame = handle.CFrame * offset * (rotation or CFrame.new())
+		p.Parent = tool
+
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0 = handle
+		weld.Part1 = p
+		weld.Parent = handle
+		return p
+	end
+
+	local cylRot = CFrame.Angles(0, math.rad(90), 0)
+
+	-- 1. СЕРЫЕ ПАНЕЛИ СВЕРХУ И СНИЗУ
+	addPart(Vector3.new(0.9, 0.25, 2.2), Color3.fromRGB(180, 190, 200), Enum.Material.SmoothPlastic, CFrame.new(0, 0.6, 0))
+	addPart(Vector3.new(0.9, 0.25, 2.2), Color3.fromRGB(130, 140, 150), Enum.Material.SmoothPlastic, CFrame.new(0, -0.6, 0))
+
+	-- 2. ТОЛСТЫЙ ДЛИННЫЙ СИНИЙ ЦИЛИНДР
+	addPart(Vector3.new(1.15, 1.205, 1.8), Color3.fromRGB(40, 180, 255), Enum.Material.Neon, CFrame.new(0, 0, -0.1), Enum.PartType.Cylinder, 0, cylRot)
+
+	-- 3. СЕРЫЕ ПЛОСКИЕ ПЛАСТИНЫ НА ТОРЦАХ СИНИЕГО ЦИЛИНДРА
+	addPart(Vector3.new(0.2, 1.25, 1.25), Color3.fromRGB(140, 150, 160), Enum.Material.SmoothPlastic, CFrame.new(0, 0, 0.8))
+	addPart(Vector3.new(0.2, 1.25, 1.25), Color3.fromRGB(140, 150, 160), Enum.Material.SmoothPlastic, CFrame.new(0, 0, -1.0))
+
+	-- 4. СЕРЫЙ ЦИЛИНДР ВПЕРЕДИ
+	addPart(Vector3.new(0.8, 0.82, 0.6), Color3.fromRGB(100, 110, 120), Enum.Material.SmoothPlastic, CFrame.new(0, 0, -1.25), Enum.PartType.Cylinder, 0, cylRot)
+
+	-- 5. ДУЛО ВПЕРЕДИ СЕРОГО ЦИЛИНДРА
+	addPart(Vector3.new(0.6, 0.62, 0.4), Color3.fromRGB(40, 180, 255), Enum.Material.Neon, CFrame.new(0, 0, -1.5), Enum.PartType.Cylinder, 0, cylRot)
+
+	-- 6. БОЛЬШОЙ СЕРЫЙ БЛОК СЗАДИ
+	addPart(Vector3.new(1.1, 1.1, 1.2), Color3.fromRGB(120, 130, 140), Enum.Material.SmoothPlastic, CFrame.new(0, 0, 1.3))
+	addPart(Vector3.new(1.2, 1.22, 0.4), Color3.fromRGB(90, 100, 110), Enum.Material.Metal, CFrame.new(0, 0, 1.8), Enum.PartType.Cylinder, 0, cylRot)
+
+	-- Точка выстрела
+	local shootPoint = Instance.new("Part")
+	shootPoint.Name = "ShootPoint"
+	shootPoint.Size = Vector3.new(0.1, 0.1, 0.1)
+	shootPoint.Transparency = 1
+	shootPoint.CFrame = handle.CFrame * CFrame.new(0, 0, -1.8)
+	shootPoint.Parent = tool
+	local shootWeld = Instance.new("WeldConstraint", handle)
+	shootWeld.Part0 = handle
+	shootWeld.Part1 = shootPoint
+	shootWeld.Parent = handle
+
+	-- Воспроизведение звука при первом взятии в руки
+	tool.Equipped:Connect(function()
+		if not hasPlayedStartupVoice then
+			hasPlayedStartupVoice = true
+			playSoundSafe(STARTUP_SOUND_ID, 2, 1, handle)
+		end
+	end)
+
+	tool.Activated:Connect(function()
+		local mouse = LocalPlayer:GetMouse()
+		local ray = Workspace:Raycast(mouse.UnitRay.Origin, mouse.UnitRay.Direction * 2000)
+		if not ray then return end
+
+		local hitPos = ray.Position
+		local normal = ray.Normal
+		drawLaserBeam(shootPoint.Position, hitPos)
+
+		local adjustedPos = hitPos + (normal * 0.1)
+		local portalCFrame = CFrame.lookAt(adjustedPos, adjustedPos + normal) * CFrame.Angles(0, math.rad(90), 0)
+
+		if currentPortalIndex == 1 then
+			if portal1 then portal1:Destroy() end
+			portal1 = createPortalFX(portalCFrame)
+			setupTeleport(portal1, portal2)
+			if portal2 then setupTeleport(portal2, portal1) end
+			currentPortalIndex = 2
+		else
+			if portal2 then portal2:Destroy() end
+			portal2 = createPortalFX(portalCFrame)
+			setupTeleport(portal2, portal1)
+			setupTeleport(portal1, portal2)
+			currentPortalIndex = 1
+		end
+	end)
+
+	return tool
+end
+
+-- Выдача пушки без удаления при сбросе
+local function giveTool()
+	local backpack = LocalPlayer:WaitForChild("Backpack")
+	local character = LocalPlayer.Character
+	if not backpack:FindFirstChild("Portal Gun") and not (character and character:FindFirstChild("Portal Gun")) then
+		local tool = buildPortalGun()
+		tool.Parent = backpack
+	end
+end
+
+giveTool()
+LocalPlayer.CharacterAdded:Connect(function()
+	task.wait(0.5)
+	giveTool()
+end)
+
+-- Кнопка сброса порталов на экране (пушку не трогает)
+local sg = playerGui:FindFirstChild("PortalGunUI")
+if not sg then
+	sg = Instance.new("ScreenGui")
+	sg.Name = "PortalGunUI"
+	sg.ResetOnSpawn = false
+	sg.Parent = playerGui
+
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(0, 140, 0, 45)
+	btn.Position = UDim2.new(0.8, -10, 0.65, 0)
+	btn.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+	btn.TextColor3 = Color3.fromRGB(40, 180, 255)
+	btn.Text = "Reset Portals (R)"
+	btn.TextScaled = true
+	btn.Font = Enum.Font.SourceSansBold
+	btn.Parent = sg
+
+	local corner = Instance.new("UICorner", btn)
+	corner.CornerRadius = UDim.new(0, 8)
+	btn.MouseButton1Click:Connect(resetPortals)
+end
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+	if gpe then return end
+	if input.KeyCode == Enum.KeyCode.R then
+		resetPortals()
+	end
+end)
