@@ -1,0 +1,593 @@
+--==================================================
+-- EVIL MORTY'S PORTAL GUN (WORKING)
+--==================================================
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local CoreGui = game:GetService("CoreGui")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+
+local LocalPlayer = Players.LocalPlayer
+
+local COLOR_GUN_BODY  = Color3.fromRGB(180, 155, 70)
+local COLOR_GREY      = Color3.fromRGB(120, 120, 120)
+local COLOR_BRONZE    = Color3.fromRGB(180, 155, 70)
+local COLOR_LENS_BG   = Color3.fromRGB(30, 35, 45)
+local COLOR_LENS_CORE = Color3.fromRGB(255, 230, 50)
+local COLOR_SIDE_BULB = Color3.fromRGB(0, 170, 255)
+local COLOR_FLUID     = Color3.fromRGB(255, 200, 0)
+
+local PORTAL_OUTER = Color3.fromRGB(255, 215, 0)
+local PORTAL_INNER = Color3.fromRGB(255, 255, 120)
+local BEAM_COLOR   = Color3.fromRGB(255, 230, 50)
+local SLIME_COLOR  = Color3.fromRGB(255, 215, 0)
+
+local portalA, portalB = nil, nil
+local nextPortal = "A"
+local isTeleporting = false
+local portalTool, toolHandle, gunSound = nil, nil, nil
+local lastShotTime = 0
+local tpCooldown = 0
+
+local GRIP_X = 0.05
+local GRIP_Y = -0.30
+local GRIP_Z = -0.20
+local ROT_X  = 0
+local ROT_Y  = 180
+local ROT_Z  = 0
+
+local BASE_GRIP = CFrame.new(GRIP_X, GRIP_Y, GRIP_Z) * CFrame.Angles(math.rad(ROT_X), math.rad(ROT_Y), math.rad(ROT_Z))
+
+local tpSoundA = Instance.new("Sound")
+tpSoundA.SoundId = "rbxassetid://1013378689"
+tpSoundA.Volume = 1.5
+tpSoundA.PlaybackSpeed = 1.0
+tpSoundA.Parent = workspace
+
+local tpSoundB = Instance.new("Sound")
+tpSoundB.SoundId = "rbxassetid://1013378689"
+tpSoundB.Volume = 1.5
+tpSoundB.PlaybackSpeed = 1.0
+tpSoundB.Parent = workspace
+
+local spawnSound = Instance.new("Sound")
+spawnSound.SoundId = "rbxassetid://1013378689"
+spawnSound.Volume = 1.3
+spawnSound.PlaybackSpeed = 1.0
+spawnSound.Parent = workspace
+
+local function clearOldItems()
+	local char = LocalPlayer.Character
+	local bp = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:WaitForChild("Backpack")
+	for _, c in ipairs({bp, char}) do
+		if c then
+			for _, item in ipairs(c:GetChildren()) do
+				if item:IsA("Tool") and item.Name == "EvilMortyPortalGun" then item:Destroy() end
+			end
+		end
+	end
+	portalTool, toolHandle, gunSound = nil, nil, nil
+end
+clearOldItems()
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "PortalSlimeGui"
+screenGui.ResetOnSpawn = false
+if CoreGui:FindFirstChild("PortalSlimeGui") then CoreGui.PortalSlimeGui:Destroy() end
+screenGui.Parent = CoreGui
+
+local slimeOverlay = Instance.new("Frame")
+slimeOverlay.Size = UDim2.new(1, 0, 1, 0)
+slimeOverlay.BackgroundColor3 = SLIME_COLOR
+slimeOverlay.BackgroundTransparency = 1
+slimeOverlay.Visible = false
+slimeOverlay.ZIndex = 100
+slimeOverlay.Parent = screenGui
+local slimeCorner = Instance.new("UICorner")
+slimeCorner.CornerRadius = UDim.new(0.5, 0)
+slimeCorner.Parent = slimeOverlay
+
+local function playSlimeFlash()
+	slimeOverlay.Visible = true
+	slimeOverlay.BackgroundTransparency = 1
+	slimeOverlay.Size = UDim2.new(0, 0, 0, 0)
+	slimeOverlay.Position = UDim2.new(0.5, 0, 0.5, 0)
+	local grow = TweenService:Create(slimeOverlay, TweenInfo.new(0.15, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
+		Size = UDim2.new(3.5, 0, 3.5, 0), Position = UDim2.new(-1.25, 0, -1.25, 0), BackgroundTransparency = 0.1
+	})
+	grow:Play(); grow.Completed:Wait()
+	local shrink = TweenService:Create(slimeOverlay, TweenInfo.new(0.15, Enum.EasingStyle.Sine, Enum.EasingDirection.In), { BackgroundTransparency = 1 })
+	shrink:Play(); shrink.Completed:Wait()
+	slimeOverlay.Visible = false
+end
+
+local function createPart(parent, size, color, offset, material)
+	local p = Instance.new("Part")
+	p.Size = size
+	p.Color = color
+	p.Material = material or Enum.Material.SmoothPlastic
+	p.CanCollide = false
+	p.Massless = true
+	p.CFrame = parent.CFrame * offset
+	p.Parent = portalTool
+	local w = Instance.new("WeldConstraint")
+	w.Part0 = parent
+	w.Part1 = p
+	w.Parent = parent
+	return p
+end
+
+local function createCylinder(parent, size, color, offset, material)
+	local p = Instance.new("Part")
+	p.Shape = Enum.PartType.Cylinder
+	p.Size = size
+	p.Color = color
+	p.Material = material or Enum.Material.SmoothPlastic
+	p.CanCollide = false
+	p.Massless = true
+	p.CFrame = parent.CFrame * offset
+	p.Parent = portalTool
+	local w = Instance.new("WeldConstraint")
+	w.Part0 = parent
+	w.Part1 = p
+	w.Parent = parent
+	return p
+end
+
+local function buildGun()
+	if portalTool and portalTool.Parent then return portalTool end
+
+	portalTool = Instance.new("Tool")
+	portalTool.Name = "EvilMortyPortalGun"
+	portalTool.RequiresHandle = true
+	portalTool.CanBeDropped = false
+
+	toolHandle = Instance.new("Part")
+	toolHandle.Name = "Handle"
+	toolHandle.Size = Vector3.new(0.5, 0.6, 2.2)
+	toolHandle.Color = COLOR_GUN_BODY
+	toolHandle.Material = Enum.Material.SmoothPlastic
+	toolHandle.CanCollide = false
+	toolHandle.Massless = true
+	toolHandle.Parent = portalTool
+
+	createPart(toolHandle, Vector3.new(0.9, 0.9, 0.9), COLOR_GUN_BODY, CFrame.new(0, 0, 1.0))
+	createCylinder(toolHandle, Vector3.new(0.15, 0.55, 0.55), COLOR_LENS_BG, CFrame.new(0, 0, 1.46) * CFrame.Angles(0, math.rad(90), 0))
+	createCylinder(toolHandle, Vector3.new(0.18, 0.3, 0.3), COLOR_LENS_CORE, CFrame.new(0, 0, 1.49) * CFrame.Angles(0, math.rad(90), 0), Enum.Material.Neon)
+	createPart(toolHandle, Vector3.new(0.2, 0.2, 0.2), COLOR_SIDE_BULB, CFrame.new(0.35, 0, 1.1), Enum.Material.Neon)
+	createPart(toolHandle, Vector3.new(0.4, 0.9, 0.4), COLOR_BRONZE, CFrame.new(0, -0.7, -0.2) * CFrame.Angles(math.rad(15), 0, 0))
+	createPart(toolHandle, Vector3.new(0.45, 0.7, 0.45), COLOR_FLUID, CFrame.new(0, 0.7, 0.2), Enum.Material.Neon)
+	createPart(toolHandle, Vector3.new(0.5, 0.1, 0.5), COLOR_GREY, CFrame.new(0, 1.08, 0.2))
+	createPart(toolHandle, Vector3.new(0.5, 0.1, 0.5), COLOR_GREY, CFrame.new(0, 0.32, 0.2))
+	createPart(toolHandle, Vector3.new(0.25, 0.5, 0.25), COLOR_GREY, CFrame.new(0, 0.45, -0.5))
+	createPart(toolHandle, Vector3.new(0.2, 0.35, 0.2), COLOR_GREY, CFrame.new(0, 0.35, -0.8))
+
+	portalTool.Grip = BASE_GRIP
+
+	gunSound = Instance.new("Sound")
+	gunSound.SoundId = "rbxassetid://1013378689"
+	gunSound.Volume = 3
+	gunSound.PlaybackSpeed = 1.0
+	gunSound.Parent = toolHandle
+
+	return portalTool
+end
+
+local function removePortal(portal)
+	if portal and portal.Parent then
+		if portal.Parent:IsA("Model") then portal.Parent:Destroy() else portal:Destroy() end
+	end
+end
+
+local function resetPortals()
+	removePortal(portalA); removePortal(portalB)
+	portalA, portalB, nextPortal = nil, nil, "A"
+end
+
+local function spawnPortal(hitPos, hitNorm)
+	local model = Instance.new("Model")
+	model.Name = "PortalModel"
+	model.Parent = workspace
+
+	local ring = Instance.new("Part")
+	ring.Shape = Enum.PartType.Cylinder
+	ring.Size = Vector3.new(0.1, 0.1, 0.1)
+	ring.Color = PORTAL_OUTER
+	ring.Material = Enum.Material.Neon
+	ring.Anchored, ring.CanCollide = true, false
+	ring.Parent = model
+
+	local core = Instance.new("Part")
+	core.Shape = Enum.PartType.Cylinder
+	core.Size = Vector3.new(0.12, 0.1, 0.1)
+	core.Color = PORTAL_INNER
+	core.Material = Enum.Material.Neon
+	core.Anchored, core.CanCollide, core.CanTouch = true, true, true
+	core.Parent = model
+
+	local up = Vector3.new(0, 1, 0)
+	if math.abs(hitNorm.Y) > 0.95 then up = Vector3.new(0, 0, 1) end
+	local portalCF = CFrame.lookAt(hitPos, hitPos + hitNorm, up) * CFrame.Angles(0, math.rad(-90), 0)
+	ring.CFrame = portalCF
+	core.CFrame = portalCF
+
+	core:SetAttribute("PortalNormalX", hitNorm.X)
+	core:SetAttribute("PortalNormalY", hitNorm.Y)
+	core:SetAttribute("PortalNormalZ", hitNorm.Z)
+
+	spawnSound.TimePosition = 0
+	spawnSound:Play()
+
+	task.spawn(function()
+		local info = TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+		TweenService:Create(ring, info, {Size = Vector3.new(0.1, 5.5, 5.5)}):Play()
+		TweenService:Create(core, info, {Size = Vector3.new(0.12, 4.5, 4.5)}):Play()
+	end)
+
+	return core
+end
+
+local function fireBeam(startPos, endPos)
+	local dist = (startPos - endPos).Magnitude
+	if dist < 0.01 then return end
+	local beam = Instance.new("Part")
+	beam.Shape = Enum.PartType.Cylinder
+	beam.Size = Vector3.new(dist, 0.18, 0.18)
+	beam.Color = BEAM_COLOR
+	beam.Material = Enum.Material.Neon
+	beam.Anchored, beam.CanCollide = true, false
+	beam.CFrame = CFrame.new(startPos, endPos) * CFrame.new(0, 0, -dist / 2) * CFrame.Angles(0, math.rad(90), 0)
+	beam.Parent = workspace
+	task.spawn(function()
+		local t = 0
+		while t < 0.15 do
+			t += RunService.RenderStepped:Wait()
+			beam.Transparency = t / 0.15
+		end
+		beam:Destroy()
+	end)
+end
+
+local function checkTeleport()
+	if isTeleporting then return end
+	if os.clock() - tpCooldown < 1.2 then return end
+
+	local char = LocalPlayer.Character
+	if not char then return end
+	local root = char:FindFirstChild("HumanoidRootPart")
+	local humanoid = char:FindFirstChildOfClass("Humanoid")
+	if not root then return end
+
+	local function isInside(portal)
+		if not portal or not portal.Parent then return false end
+		local pos = portal.Position
+		local dist = (root.Position - pos).Magnitude
+		return dist < 3.5
+	end
+
+	local entrance = nil
+	local exit = nil
+
+	if portalA and isInside(portalA) then
+		entrance = portalA
+		exit = portalB
+	elseif portalB and isInside(portalB) then
+		entrance = portalB
+		exit = portalA
+	end
+
+	if not entrance or not exit then return end
+	if not exit.Parent then return end
+
+	isTeleporting = true
+	tpCooldown = os.clock()
+
+	local suckSound = Instance.new("Sound")
+	suckSound.SoundId = "rbxassetid://1013378689"
+	suckSound.Volume = 2
+	suckSound.PlaybackSpeed = 1.4
+	suckSound.Parent = workspace
+	suckSound:Play()
+	Debris:AddItem(suckSound, 3)
+
+	task.spawn(playSlimeFlash)
+
+	local norm = Vector3.new(
+		exit:GetAttribute("PortalNormalX") or 0,
+		exit:GetAttribute("PortalNormalY") or 1,
+		exit:GetAttribute("PortalNormalZ") or 0
+	)
+	local exitPos = exit.Position
+
+	if humanoid then
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.PlatformStanding, false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Climbing, false)
+		humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+	end
+
+	local insidePos = exitPos + norm * 0.3
+	local jumpDir = (norm + Vector3.new(0, 0.7, 0)).Unit
+
+	root.CFrame = CFrame.new(insidePos, insidePos + norm)
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	root.AssemblyLinearVelocity = jumpDir * 45 + Vector3.new(0, 22, 0)
+
+	task.spawn(function()
+		task.wait(1.2)
+		if humanoid and humanoid.Parent then
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.PlatformStanding, true)
+			humanoid:SetStateEnabled(Enum.HumanoidStateType.Climbing, true)
+		end
+	end)
+
+	local fx = Instance.new("Part")
+	fx.Shape = Enum.PartType.Cylinder
+	fx.Size = Vector3.new(0.1, 1, 1)
+	fx.Color = PORTAL_INNER
+	fx.Material = Enum.Material.Neon
+	fx.Anchored = true
+	fx.CanCollide = false
+	fx.CFrame = CFrame.lookAt(exitPos, exitPos + norm) * CFrame.Angles(0, math.rad(90), 0)
+	fx.Parent = workspace
+
+	local info = TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	TweenService:Create(fx, info, {
+		Size = Vector3.new(0.1, 9, 9),
+		Transparency = 1
+	}):Play()
+
+	local light = Instance.new("PointLight")
+	light.Color = PORTAL_INNER
+	light.Range = 25
+	light.Brightness = 8
+	light.Parent = fx
+
+	Debris:AddItem(fx, 1)
+
+	task.spawn(function()
+		task.wait(0.3)
+		TweenService:Create(light, TweenInfo.new(0.3), { Brightness = 0 }):Play()
+	end)
+
+	task.wait(0.8)
+	isTeleporting = false
+end
+
+RunService.Heartbeat:Connect(checkTeleport)
+
+local function raycastFromScreen(sx, sy)
+	local cam = workspace.CurrentCamera
+	if not cam then return nil end
+	local ray = cam:ScreenPointToRay(sx, sy)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.IgnoreWater = true
+	params.RespectCanCollide = false
+	local ignore = {}
+	if LocalPlayer.Character then table.insert(ignore, LocalPlayer.Character) end
+	if portalTool then table.insert(ignore, portalTool) end
+	if portalA and portalA.Parent then table.insert(ignore, portalA.Parent) end
+	if portalB and portalB.Parent then table.insert(ignore, portalB.Parent) end
+	params.FilterDescendantsInstances = ignore
+	return workspace:Raycast(ray.Origin, ray.Direction * 100000, params)
+end
+
+local function isGunEquipped()
+	local char = LocalPlayer.Character
+	if not char then return false end
+	local tool = char:FindFirstChildOfClass("Tool")
+	return tool and tool.Name == "EvilMortyPortalGun"
+end
+
+local function placePortalFromRay(res)
+	if not res then return end
+	if not isGunEquipped() then return end
+	if os.clock() - lastShotTime < 0.3 then return end
+	lastShotTime = os.clock()
+
+	if portalTool and portalTool.Parent then
+		local recoilGrip = BASE_GRIP * CFrame.new(0, 0.08, 0.2) * CFrame.Angles(math.rad(10), 0, 0)
+		local tween1 = TweenService:Create(portalTool, TweenInfo.new(0.05, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+			Grip = recoilGrip
+		})
+		tween1:Play()
+		tween1.Completed:Connect(function()
+			if not portalTool or not portalTool.Parent then return end
+			local tween2 = TweenService:Create(portalTool, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+				Grip = BASE_GRIP
+			})
+			tween2:Play()
+		end)
+	end
+
+	local cam = workspace.CurrentCamera
+	if cam then
+		local baseCF = cam.CFrame
+		local offset = CFrame.new(
+			math.random(-35, 35) / 1000,
+			math.random(-35, 35) / 1000,
+			0
+		) * CFrame.Angles(
+			math.rad(math.random(-18, 18) / 10),
+			math.rad(math.random(-18, 18) / 10),
+			math.rad(math.random(-18, 18) / 10)
+		)
+		local tweenCam1 = TweenService:Create(cam, TweenInfo.new(0.04, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+			CFrame = baseCF * offset
+		})
+		tweenCam1:Play()
+		tweenCam1.Completed:Connect(function()
+			local tweenCam2 = TweenService:Create(cam, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+				CFrame = baseCF
+			})
+			tweenCam2:Play()
+		end)
+	end
+
+	if gunSound then
+		gunSound.TimePosition = 0
+		gunSound:Play()
+	end
+
+	local beamStart = toolHandle.Position
+	fireBeam(beamStart, res.Position)
+
+	local muzzlePos = beamStart + (res.Position - beamStart).Unit * 1.5
+	local flash = Instance.new("Part")
+	flash.Shape = Enum.PartType.Ball
+	flash.Size = Vector3.new(1.2, 1.2, 1.2)
+	flash.Color = Color3.fromRGB(255, 240, 100)
+	flash.Material = Enum.Material.Neon
+	flash.Anchored = true
+	flash.CanCollide = false
+	flash.CFrame = CFrame.new(muzzlePos)
+	flash.Parent = workspace
+
+	local flashLight = Instance.new("PointLight")
+	flashLight.Color = Color3.fromRGB(255, 240, 100)
+	flashLight.Range = 25
+	flashLight.Brightness = 6
+	flashLight.Parent = flash
+
+	task.spawn(function()
+		local info = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		local tw = TweenService:Create(flash, info, {
+			Size = Vector3.new(0.1, 0.1, 0.1),
+			Transparency = 1
+		})
+		local tw2 = TweenService:Create(flashLight, info, { Brightness = 0 })
+		tw:Play()
+		tw2:Play()
+		tw.Completed:Wait()
+		flash:Destroy()
+	end)
+
+	for i = 1, 8 do
+		local spark = Instance.new("Part")
+		spark.Shape = Enum.PartType.Ball
+		spark.Size = Vector3.new(0.15, 0.15, 0.15)
+		spark.Color = Color3.fromRGB(255, 220, 80)
+		spark.Material = Enum.Material.Neon
+		spark.Anchored = false
+		spark.CanCollide = false
+		spark.Massless = true
+		spark.CFrame = CFrame.new(muzzlePos)
+		spark.AssemblyLinearVelocity = (res.Position - beamStart).Unit * math.random(15, 30)
+			+ Vector3.new(math.random(-10, 10), math.random(5, 15), math.random(-10, 10))
+		spark.Parent = workspace
+
+		Debris:AddItem(spark, 0.6)
+	end
+
+	if nextPortal == "A" then
+		removePortal(portalA)
+		portalA = spawnPortal(res.Position, res.Normal)
+		nextPortal = "B"
+	else
+		removePortal(portalB)
+		portalB = spawnPortal(res.Position, res.Normal)
+		nextPortal = "A"
+	end
+end
+
+-- МЕНЮ
+local menuOpen = false
+local menuBtn = Instance.new("TextButton")
+menuBtn.Size = UDim2.new(0, 60, 0, 60)
+menuBtn.Position = UDim2.new(0, 20, 0, 200)
+menuBtn.BackgroundColor3 = Color3.fromRGB(255, 215, 0)
+menuBtn.Text = "☰"
+menuBtn.TextColor3 = Color3.fromRGB(60, 55, 45)
+menuBtn.TextSize = 30
+menuBtn.Font = Enum.Font.SourceSansBold
+menuBtn.Parent = screenGui
+local mbc = Instance.new("UICorner"); mbc.CornerRadius = UDim.new(1, 0); mbc.Parent = menuBtn
+
+local menuFrame = Instance.new("Frame")
+menuFrame.Size = UDim2.new(0, 200, 0, 110)
+menuFrame.Position = UDim2.new(0, 90, 0, 170)
+menuFrame.BackgroundColor3 = Color3.fromRGB(255, 215, 0)
+menuFrame.BackgroundTransparency = 0.1
+menuFrame.Visible = false
+menuFrame.Parent = screenGui
+local mfc = Instance.new("UICorner"); mfc.CornerRadius = UDim.new(0, 12); mfc.Parent = menuFrame
+
+local menuTitle = Instance.new("TextLabel")
+menuTitle.Size = UDim2.new(1, 0, 0, 30)
+menuTitle.Position = UDim2.new(0, 0, 0, 5)
+menuTitle.BackgroundTransparency = 1
+menuTitle.Text = "Портал-меню"
+menuTitle.TextColor3 = Color3.fromRGB(60, 55, 45)
+menuTitle.TextSize = 16
+menuTitle.Font = Enum.Font.SourceSansBold
+menuTitle.Parent = menuFrame
+
+local resetBtn = Instance.new("TextButton")
+resetBtn.Size = UDim2.new(0.85, 0, 0, 40)
+resetBtn.Position = UDim2.new(0.075, 0, 0.45, 0)
+resetBtn.BackgroundColor3 = Color3.fromRGB(60, 55, 45)
+resetBtn.Text = "Сбросить порталы"
+resetBtn.TextColor3 = Color3.fromRGB(255, 215, 0)
+resetBtn.TextSize = 15
+resetBtn.Font = Enum.Font.SourceSansBold
+resetBtn.Parent = menuFrame
+local rbc = Instance.new("UICorner"); rbc.CornerRadius = UDim.new(0, 8); rbc.Parent = resetBtn
+
+menuBtn.MouseButton1Click:Connect(function()
+	menuOpen = not menuOpen
+	menuFrame.Visible = menuOpen
+end)
+resetBtn.MouseButton1Click:Connect(resetPortals)
+
+-- ТАП
+local touchStartPos, touchStartTime = nil, 0
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	if input.UserInputType == Enum.UserInputType.Touch then
+		touchStartPos = Vector2.new(input.Position.X, input.Position.Y)
+		touchStartTime = os.clock()
+	end
+end)
+UserInputService.InputEnded:Connect(function(input, processed)
+	if processed then return end
+	if input.UserInputType == Enum.UserInputType.Touch and touchStartPos then
+		local endPos = Vector2.new(input.Position.X, input.Position.Y)
+		local moved = (endPos - touchStartPos).Magnitude
+		local dt = os.clock() - touchStartTime
+		if moved < 20 and dt < 0.5 then
+			local res = raycastFromScreen(touchStartPos.X, touchStartPos.Y)
+			if res then placePortalFromRay(res) end
+		end
+		touchStartPos = nil
+	end
+end)
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		local mp = UserInputService:GetMouseLocation()
+		local res = raycastFromScreen(mp.X, mp.Y)
+		if res then placePortalFromRay(res) end
+	end
+end)
+
+local function giveTool()
+	clearOldItems()
+	buildGun()
+	local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+	if not bp then bp = LocalPlayer:WaitForChild("Backpack", 5) end
+	if bp and portalTool then portalTool.Parent = bp end
+end
+giveTool()
+LocalPlayer.CharacterAdded:Connect(function(char)
+	task.wait(1)
+	giveTool()
+end)
