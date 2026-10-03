@@ -1,0 +1,433 @@
+--==================================================
+-- EVIL MORTY: ЛАЗЕРЫ ИЗ ГЛАЗ (ФИНАЛ)
+--==================================================
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+
+-- === ЦВЕТА ===
+local LASER_COLOR = Color3.fromRGB(150, 255, 50)
+local LASER_GLOW = Color3.fromRGB(200, 255, 100)
+local LASER_THICK = 0.9
+
+-- === НАСТРОЙКИ (ФИНАЛЬНЫЕ) ===
+local EYE_X = 0.10
+local EYE_Y = 0.23
+local EYE_Z = -0.60
+
+local EYE_MOVE_Z = -0.35
+local RANGE = 3000
+local COOLDOWN = 1.2
+
+local laserOn = false
+local lastShot = 0
+local activeBeams = {}
+
+-- === ЗВУК ===
+local laserSound = Instance.new("Sound")
+laserSound.SoundId = "rbxassetid://131961136"
+laserSound.Volume = 2
+laserSound.PlaybackSpeed = 1.5
+laserSound.Looped = true
+laserSound.Parent = workspace
+
+-- ==================================================
+-- СВЕЧЕНИЕ ГЛАЗ
+-- ==================================================
+
+local eyeGlowParts = {}
+local function updateEyeGlow()
+	for _, p in ipairs(eyeGlowParts) do
+		if p and p.Parent then p:Destroy() end
+	end
+	eyeGlowParts = {}
+
+	if laserOn then return end
+
+	local char = LocalPlayer.Character
+	if not char then return end
+	local head = char:FindFirstChild("Head")
+	if not head then return end
+
+	local function makeEye(offsetX)
+		local eye = Instance.new("Part")
+		eye.Shape = Enum.PartType.Ball
+		eye.Size = Vector3.new(0.12, 0.18, 0.12)
+		eye.Color = LASER_COLOR
+		eye.Material = Enum.Material.Neon
+		eye.CanCollide = false
+		eye.Massless = true
+		eye.Anchored = false
+		eye.CFrame = head.CFrame * CFrame.new(offsetX, EYE_Y, EYE_Z)
+		eye.Parent = char
+		local w = Instance.new("WeldConstraint")
+		w.Part0 = head
+		w.Part1 = eye
+		w.Parent = eye
+		table.insert(eyeGlowParts, eye)
+	end
+
+	makeEye(-EYE_X)
+	makeEye(EYE_X)
+end
+
+task.spawn(function()
+	while true do
+		task.wait(0.15)
+		updateEyeGlow()
+	end
+end)
+
+-- ==================================================
+-- ПОЗИЦИИ ГЛАЗ
+-- ==================================================
+
+local function getEyePositions()
+	local char = LocalPlayer.Character
+	if not char then return nil end
+	local head = char:FindFirstChild("Head")
+	if not head then return nil end
+
+	local root = char:FindFirstChild("HumanoidRootPart")
+	local speed = 0
+	if root then
+		local vel = root.AssemblyLinearVelocity
+		speed = math.sqrt(vel.X * vel.X + vel.Z * vel.Z)
+	end
+
+	local eyeZ = EYE_Z
+	if speed > 2 then eyeZ = EYE_MOVE_Z end
+
+	local rightEye = head.CFrame * CFrame.new(EYE_X, EYE_Y, eyeZ)
+	local leftEye = head.CFrame * CFrame.new(-EYE_X, EYE_Y, eyeZ)
+	return rightEye, leftEye
+end
+
+-- ==================================================
+-- ЛУЧ
+-- ==================================================
+
+local function createLaserBeam(startPos, endPos)
+	local dist = (startPos - endPos).Magnitude
+	if dist < 0.1 then return nil end
+
+	local beam = Instance.new("Part")
+	beam.Shape = Enum.PartType.Cylinder
+	beam.Size = Vector3.new(dist, LASER_THICK, LASER_THICK)
+	beam.Color = LASER_COLOR
+	beam.Material = Enum.Material.Neon
+	beam.Anchored = true
+	beam.CanCollide = false
+	beam.CFrame = CFrame.new(startPos, endPos) * CFrame.new(0, 0, -dist / 2) * CFrame.Angles(0, math.rad(90), 0)
+	beam.Parent = workspace
+
+	local glow = Instance.new("PointLight")
+	glow.Color = LASER_GLOW
+	glow.Range = 30
+	glow.Brightness = 6
+	glow.Parent = beam
+
+	return beam
+end
+
+-- ==================================================
+-- РАСПАДЕНИЕ
+-- ==================================================
+
+local function visualDisintegrate(targetChar)
+	local parts = {}
+	local accessories = {}
+	local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
+	local targetHum = targetChar:FindFirstChildOfClass("Humanoid")
+	if not targetRoot then return end
+
+	for _, p in ipairs(targetChar:GetDescendants()) do
+		if p:IsA("BasePart") then
+			table.insert(parts, p)
+		elseif p:IsA("Accessory") or p:IsA("Shirt") or p:IsA("Pants") or p:IsA("ShirtGraphic") then
+			table.insert(accessories, p)
+		end
+	end
+
+	for _, acc in ipairs(accessories) do
+		if acc and acc.Parent then acc:Destroy() end
+	end
+
+	for _, part in ipairs(parts) do
+		if part and part.Parent then
+			part.Color = LASER_COLOR
+			part.Material = Enum.Material.Neon
+		end
+	end
+
+	local glow = Instance.new("Part")
+	glow.Shape = Enum.PartType.Ball
+	glow.Size = Vector3.new(6, 6, 6)
+	glow.Color = LASER_COLOR
+	glow.Material = Enum.Material.Neon
+	glow.Anchored = true
+	glow.CanCollide = false
+	glow.Transparency = 0.5
+	glow.CFrame = targetRoot.CFrame
+	glow.Parent = workspace
+
+	local glowLight = Instance.new("PointLight")
+	glowLight.Color = LASER_COLOR
+	glowLight.Range = 35
+	glowLight.Brightness = 10
+	glowLight.Parent = glow
+
+	local zapSound = Instance.new("Sound")
+	zapSound.SoundId = "rbxassetid://131961136"
+	zapSound.Volume = 3
+	zapSound.PlaybackSpeed = 2.0
+	zapSound.Parent = targetRoot
+	zapSound:Play()
+	Debris:AddItem(zapSound, 2)
+
+	task.spawn(function()
+		local info = TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		TweenService:Create(glow, info, {Size = Vector3.new(10, 10, 10), Transparency = 0.8}):Play()
+	end)
+
+	task.wait(0.6)
+
+	for _, part in ipairs(parts) do
+		if part and part.Parent then
+			part.Anchored = false
+			part.CanCollide = true
+			part.Massless = false
+
+			part.AssemblyLinearVelocity = Vector3.new(
+				math.random(-80, 80),
+				math.random(15, 100),
+				math.random(-80, 80)
+			)
+
+			part.AssemblyAngularVelocity = Vector3.new(
+				math.random(-60, 60),
+				math.random(-60, 60),
+				math.random(-60, 60)
+			)
+
+			task.spawn(function()
+				task.wait(1.5)
+				if part and part.Parent then
+					TweenService:Create(part, TweenInfo.new(1.0), {
+						Color = LASER_COLOR,
+						Transparency = 0.5
+					}):Play()
+				end
+			end)
+		end
+	end
+
+	local flash = Instance.new("Part")
+	flash.Shape = Enum.PartType.Ball
+	flash.Size = Vector3.new(10, 10, 10)
+	flash.Color = LASER_GLOW
+	flash.Material = Enum.Material.Neon
+	flash.Anchored = true
+	flash.CanCollide = false
+	flash.Transparency = 0.1
+	flash.CFrame = targetRoot.CFrame
+	flash.Parent = workspace
+
+	local flashLight = Instance.new("PointLight")
+	flashLight.Color = LASER_GLOW
+	flashLight.Range = 50
+	flashLight.Brightness = 15
+	flashLight.Parent = flash
+
+	local ring = Instance.new("Part")
+	ring.Shape = Enum.PartType.Cylinder
+	ring.Size = Vector3.new(0.1, 1, 1)
+	ring.Color = LASER_COLOR
+	ring.Material = Enum.Material.Neon
+	ring.Anchored = true
+	ring.CanCollide = false
+	ring.CFrame = CFrame.lookAt(targetRoot.Position, targetRoot.Position + Vector3.new(0, 1, 0)) * CFrame.Angles(0, math.rad(90), 0)
+	ring.Parent = workspace
+
+	task.spawn(function()
+		local info = TweenInfo.new(0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		TweenService:Create(ring, info, {Size = Vector3.new(0.1, 20, 20), Transparency = 1}):Play()
+		task.wait(0.9)
+		ring:Destroy()
+	end)
+
+	for i = 1, 30 do
+		local spark = Instance.new("Part")
+		spark.Shape = Enum.PartType.Ball
+		spark.Size = Vector3.new(math.random(2, 4) / 10, math.random(2, 4) / 10, math.random(2, 4) / 10)
+		spark.Color = LASER_COLOR
+		spark.Material = Enum.Material.Neon
+		spark.Anchored = false
+		spark.CanCollide = false
+		spark.Massless = true
+		spark.CFrame = targetRoot.CFrame + Vector3.new(
+			math.random(-3, 3),
+			math.random(-1, 4),
+			math.random(-3, 3)
+		)
+		spark.AssemblyLinearVelocity = Vector3.new(
+			math.random(-80, 80),
+			math.random(30, 100),
+			math.random(-80, 80)
+		)
+		spark.Parent = workspace
+		Debris:AddItem(spark, 2)
+	end
+
+	task.spawn(function()
+		local info = TweenInfo.new(0.6, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+		TweenService:Create(flash, info, {Size = Vector3.new(0.1, 0.1, 0.1), Transparency = 1}):Play()
+		TweenService:Create(flashLight, info, {Brightness = 0}):Play()
+		TweenService:Create(glow, info, {Size = Vector3.new(0.1, 0.1, 0.1), Transparency = 1}):Play()
+		TweenService:Create(glowLight, info, {Brightness = 0}):Play()
+		task.wait(0.7)
+		flash:Destroy()
+		glow:Destroy()
+	end)
+
+	for _, part in ipairs(parts) do
+		task.spawn(function()
+			task.wait(2.5)
+			if part and part.Parent then
+				TweenService:Create(part, TweenInfo.new(1.0), {Transparency = 1}):Play()
+				task.wait(1.2)
+				if part and part.Parent then
+					part:Destroy()
+				end
+			end
+		end)
+	end
+
+	if targetHum then
+		pcall(function() targetHum.Health = 0 end)
+	end
+end
+
+-- ==================================================
+-- ЛАЗЕРЫ
+-- ==================================================
+
+local function updateLasers()
+	for _, beam in ipairs(activeBeams) do
+		if beam and beam.Parent then beam:Destroy() end
+	end
+	activeBeams = {}
+
+	if not laserOn then return end
+
+	local rightEye, leftEye = getEyePositions()
+	if not rightEye or not leftEye then return end
+
+	local lookDir = Camera.CFrame.LookVector
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.IgnoreWater = true
+	params.FilterDescendantsInstances = {LocalPlayer.Character}
+
+	local originR = rightEye.Position
+	local resultR = workspace:Raycast(originR, lookDir * RANGE, params)
+
+	local originL = leftEye.Position
+	local resultL = workspace:Raycast(originL, lookDir * RANGE, params)
+
+	local endPosR = resultR and resultR.Position or (originR + lookDir * RANGE)
+	local endPosL = resultL and resultL.Position or (originL + lookDir * RANGE)
+
+	local beamR = createLaserBeam(originR, endPosR)
+	local beamL = createLaserBeam(originL, endPosL)
+
+	if beamR then table.insert(activeBeams, beamR) end
+	if beamL then table.insert(activeBeams, beamL) end
+
+	if os.clock() - lastShot < COOLDOWN then return end
+
+	local hitChar = nil
+	if resultR then
+		local c = resultR.Instance:FindFirstAncestorOfClass("Model")
+		if c then
+			local plr = Players:GetPlayerFromCharacter(c)
+			if plr and plr ~= LocalPlayer then hitChar = c end
+		end
+	end
+	if not hitChar and resultL then
+		local c = resultL.Instance:FindFirstAncestorOfClass("Model")
+		if c then
+			local plr = Players:GetPlayerFromCharacter(c)
+			if plr and plr ~= LocalPlayer then hitChar = c end
+		end
+	end
+
+	if hitChar then
+		lastShot = os.clock()
+		task.spawn(function()
+			visualDisintegrate(hitChar)
+		end)
+	end
+end
+
+RunService.Heartbeat:Connect(updateLasers)
+
+-- ==================================================
+-- КНОПКА ЛАЗЕР
+-- ==================================================
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "GreenLaserGui"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local laserBtn = Instance.new("TextButton")
+laserBtn.Size = UDim2.new(0, 90, 0, 90)
+laserBtn.Position = UDim2.new(1, -110, 1, -220)
+laserBtn.BackgroundColor3 = LASER_COLOR
+laserBtn.Text = "ЛАЗЕР"
+laserBtn.TextColor3 = Color3.fromRGB(0, 60, 0)
+laserBtn.TextSize = 16
+laserBtn.Font = Enum.Font.SourceSansBold
+laserBtn.Parent = screenGui
+local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(1, 0); bc.Parent = laserBtn
+
+laserBtn.MouseButton1Click:Connect(function()
+	if laserOn then
+		laserOn = false
+		laserBtn.Text = "ЛАЗЕР"
+		laserBtn.BackgroundColor3 = LASER_COLOR
+		laserSound:Stop()
+		for _, beam in ipairs(activeBeams) do
+			if beam and beam.Parent then beam:Destroy() end
+		end
+		activeBeams = {}
+	else
+		laserOn = true
+		laserBtn.Text = "СТОП"
+		laserBtn.BackgroundColor3 = Color3.fromRGB(255, 100, 50)
+		laserSound.TimePosition = 0
+		laserSound:Play()
+	end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function(char)
+	task.wait(0.5)
+	laserOn = false
+	laserBtn.Text = "ЛАЗЕР"
+	laserBtn.BackgroundColor3 = LASER_COLOR
+	laserSound:Stop()
+	for _, beam in ipairs(activeBeams) do
+		if beam and beam.Parent then beam:Destroy() end
+	end
+	activeBeams = {}
+end)
+
+print("[Green Eye Lasers] Загружено.")
