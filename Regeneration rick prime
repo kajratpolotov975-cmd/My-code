@@ -1,0 +1,447 @@
+--==================================================
+-- RICK PRIME: РЕГЕНЕРАЦИЯ + СМЕРТЬ
+--==================================================
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local REGEN_TIME = 5.0
+local AUTO_REGEN_DAMAGE = true
+
+local BONE_C   = Color3.fromRGB(240, 235, 220)
+local NERVE_C  = Color3.fromRGB(225, 200, 175)
+local ARTERY_C = Color3.fromRGB(200, 35, 30)
+local VEIN_C   = Color3.fromRGB(55, 85, 200)
+local FLESH_C  = Color3.fromRGB(165, 30, 25)
+local BLOOD_C  = Color3.fromRGB(150, 15, 12)
+
+local PRINT_SOUND = "rbxassetid://84312631986360"
+local LAUGH_SOUND = "rbxassetid://104144683858662"
+
+local R6_LIMBS = {
+    RightArm = {"Right Arm"}, LeftArm = {"Left Arm"},
+    RightLeg = {"Right Leg"}, LeftLeg = {"Left Leg"}
+}
+local R15_LIMBS = {
+    RightArm = {"RightUpperArm", "RightLowerArm", "RightHand"},
+    LeftArm = {"LeftUpperArm", "LeftLowerArm", "LeftHand"},
+    RightLeg = {"RightUpperLeg", "RightLowerLeg", "RightFoot"},
+    LeftLeg = {"LeftUpperLeg", "LeftLowerLeg", "LeftFoot"}
+}
+local TORSO_PARTS = {
+    R6 = {"Torso", "Head"},
+    R15 = {"UpperTorso", "LowerTorso", "Head"}
+}
+
+local busyLimbs = {}
+local activePrintSound = nil
+local printUsers = 0
+local deathActive = false
+local deathCFrame = nil
+local isRegenerating = false
+
+local function playSoundAt(part, id, vol, speed, looped)
+    if not part then return nil end
+    local s = Instance.new("Sound")
+    s.SoundId = id
+    s.Volume = vol or 1
+    s.PlaybackSpeed = speed or 1
+    s.Looped = looped or false
+    s.Parent = part
+    s:Play()
+    if not looped then
+        s.Ended:Connect(function() s:Destroy() end)
+        task.delay(10, function() if s and s.Parent then s:Destroy() end end)
+    end
+    return s
+end
+
+local function startPrintSound(part)
+    printUsers = printUsers + 1
+    if activePrintSound and activePrintSound.Parent then return end
+    activePrintSound = playSoundAt(part, PRINT_SOUND, 1, 1, true)
+end
+
+local function endPrintSound()
+    printUsers = printUsers - 1
+    if printUsers <= 0 then
+        printUsers = 0
+        if activePrintSound then
+            pcall(function() activePrintSound:Stop() end)
+            pcall(function() activePrintSound:Destroy() end)
+            activePrintSound = nil
+        end
+    end
+end
+
+local function bioPart(name, finalSize, color, material, duration, parent, offset, isCylinder)
+    local char = LocalPlayer.Character
+    if not char or not parent or not parent.Parent then return nil end
+
+    local p = Instance.new("Part")
+    p.Name = "Bio_" .. name
+    p.Color = color
+    p.Material = material
+    p.Transparency = 0
+    p.CanCollide, p.CanTouch, p.CanQuery, p.Massless, p.Anchored = false, false, false, true, false
+    p.Parent = char
+
+    if isCylinder then
+        p.Shape = Enum.PartType.Cylinder
+        p.Size = Vector3.new(0.05, finalSize.Y * 0.1, finalSize.Z * 0.1)
+    else
+        p.Size = Vector3.new(finalSize.X * 0.1, 0.05, finalSize.Z * 0.1)
+    end
+
+    local weld = Instance.new("Weld")
+    weld.Part0 = parent
+    weld.Part1 = p
+    weld.Parent = p
+
+    local function updateWeld()
+        if isCylinder then
+            weld.C0 = offset * CFrame.Angles(0, 0, math.rad(90)) * CFrame.new(-p.Size.X / 2, 0, 0)
+        else
+            weld.C0 = offset * CFrame.new(0, -p.Size.Y / 2, 0)
+        end
+    end
+    updateWeld()
+
+    TweenService:Create(p, TweenInfo.new(duration, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {Size = finalSize}):Play()
+
+    task.spawn(function()
+        local elapsed = 0
+        while elapsed < duration do
+            if not p.Parent then return end
+            updateWeld()
+            elapsed = elapsed + task.wait()
+        end
+        updateWeld()
+    end)
+
+    return p
+end
+
+local function createSkullOnHead(head, character)
+    if not head then return end
+    local skull = Instance.new("Part")
+    skull.Name = "Bio_Skull"
+    skull.Shape = Enum.PartType.Ball
+    skull.Size = Vector3.new(0.05, 0.05, 0.05)
+    skull.Color = BONE_C
+    skull.Material = Enum.Material.Slate
+    skull.CanCollide, skull.CanTouch, skull.CanQuery, skull.Massless, skull.Anchored = false, false, false, true, false
+    skull.Parent = character
+
+    local w = Instance.new("Weld")
+    w.Part0 = head
+    w.Part1 = skull
+    w.C0 = CFrame.new()
+    w.Parent = skull
+
+    TweenService:Create(skull, TweenInfo.new(REGEN_TIME * 0.30, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
+        Size = head.Size * 0.98
+    }):Play()
+
+    task.spawn(function()
+        task.wait(REGEN_TIME * 0.15)
+        if not skull.Parent then return end
+        local function makeEye(xPos)
+            local eye = Instance.new("Part")
+            eye.Name = "Bio_SkullEye"
+            eye.Size = Vector3.new(0.05, 0.05, 0.05)
+            eye.Color = Color3.fromRGB(10, 10, 10)
+            eye.Material = Enum.Material.SmoothPlastic
+            eye.CanCollide, eye.CanTouch, eye.CanQuery, eye.Massless, eye.Anchored = false, false, false, true, false
+            eye.Parent = character
+            local ew = Instance.new("Weld")
+            ew.Part0 = skull
+            ew.Part1 = eye
+            ew.C0 = CFrame.new(xPos, 0.1, -0.5)
+            ew.Parent = eye
+            TweenService:Create(eye, TweenInfo.new(REGEN_TIME * 0.15, Enum.EasingStyle.Sine), {
+                Size = Vector3.new(0.2, 0.22, 0.15)
+            }):Play()
+        end
+        makeEye(0.22)
+        makeEye(-0.22)
+    end)
+end
+
+local function spawnBlood(anchorPart, origSize, count)
+    local char = LocalPlayer.Character
+    if not char or not anchorPart then return end
+    for i = 1, count do
+        local blood = Instance.new("Part")
+        blood.Name = "Bio_Blood"
+        blood.Shape = Enum.PartType.Ball
+        blood.Size = Vector3.new(0.18, 0.18, 0.18) * (0.8 + math.random() * 1.4)
+        blood.Color = BLOOD_C
+        blood.Material = Enum.Material.SmoothPlastic
+        blood.CanCollide, blood.CanTouch, blood.CanQuery, blood.Massless, blood.Anchored = false, false, false, true, false
+        blood.Parent = char
+        blood.CFrame = anchorPart.CFrame * CFrame.new(
+            (math.random() - 0.5) * origSize.X,
+            (math.random() - 0.5) * origSize.Y,
+            (math.random() - 0.5) * origSize.Z
+        )
+        blood.AssemblyLinearVelocity = Vector3.new((math.random() - 0.5) * 40, math.random(15, 35), (math.random() - 0.5) * 40)
+        blood.AssemblyAngularVelocity = Vector3.new(math.random(-30, 30), math.random(-30, 30), math.random(-30, 30))
+        task.delay(1.5, function() if blood and blood.Parent then blood:Destroy() end end)
+    end
+end
+
+local function hideBody(character)
+    for _, obj in ipairs(character:GetDescendants()) do
+        if obj:IsA("BasePart") and obj.Name ~= "HumanoidRootPart" then
+            obj.Transparency = 1
+            obj.CanCollide = false
+            obj.LocalTransparencyModifier = 1
+        elseif obj:IsA("Decal") then
+            obj.Transparency = 1
+        end
+    end
+end
+
+local function regeneratePart(groupName, partsInOrder)
+    if busyLimbs[groupName] then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not char or not hum then return end
+    local parts = {}
+    for _, n in ipairs(partsInOrder) do
+        local p = char:FindFirstChild(n)
+        if p then table.insert(parts, p) end
+    end
+    if #parts == 0 then return end
+    busyLimbs[groupName] = true
+
+    task.spawn(function()
+        local anchorPart = parts[1]
+        local origSize = anchorPart.Size
+        local origColor = anchorPart.Color
+        local origMat = anchorPart.Material
+        local top = CFrame.new(0, origSize.Y / 2, 0)
+
+        startPrintSound(anchorPart)
+        for _, p in ipairs(parts) do
+            p.Transparency = 1
+            p.LocalTransparencyModifier = 1
+            p.CanCollide = false
+        end
+        local bloodCount = (groupName == "Torso") and 40 or 25
+        spawnBlood(anchorPart, origSize, bloodCount)
+        task.wait(0.2)
+
+        local boneT  = REGEN_TIME * 0.30
+        local nerveT = REGEN_TIME * 0.25
+        local fleshT = REGEN_TIME * 0.25
+        local skinT  = REGEN_TIME * 0.20
+
+        local boneLen = origSize.Y * 0.95
+        local boneDia = math.min(origSize.X, origSize.Z) * 0.3
+
+        local bone = Instance.new("Part")
+        bone.Name = "Bio_Bone"
+        bone.Shape = Enum.PartType.Cylinder
+        bone.Size = Vector3.new(0.05, boneDia * 0.2, boneDia * 0.2)
+        bone.Color = BONE_C
+        bone.Material = Enum.Material.Slate
+        bone.CanCollide, bone.CanTouch, bone.CanQuery, bone.Massless, bone.Anchored = false, false, false, true, false
+        bone.Parent = char
+
+        local bw = Instance.new("Weld")
+        bw.Part0 = anchorPart
+        bw.Part1 = bone
+        bw.Parent = bone
+
+        local function updateBoneWeld()
+            bw.C0 = top * CFrame.Angles(0, 0, math.rad(90)) * CFrame.new(-bone.Size.X / 2, 0, 0)
+        end
+        updateBoneWeld()
+
+        TweenService:Create(bone, TweenInfo.new(boneT, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
+            Size = Vector3.new(boneLen, boneDia, boneDia)
+        }):Play()
+
+        task.spawn(function()
+            local elapsed = 0
+            while elapsed < boneT do
+                if not bone.Parent then return end
+                updateBoneWeld()
+                elapsed = elapsed + task.wait()
+            end
+        end)
+
+        if groupName == "Torso" then
+            local headPart = char:FindFirstChild("Head")
+            if headPart then createSkullOnHead(headPart, char) end
+        end
+
+        task.wait(boneT)
+
+        for i = 1, 4 do
+            local a = (i - 1) * math.pi / 2 + math.pi / 4
+            local r = origSize.X * 0.35
+            bioPart("Nerve" .. i, Vector3.new(0.04, origSize.Y, 0.04), NERVE_C, Enum.Material.SmoothPlastic, nerveT, anchorPart, top * CFrame.new(math.cos(a) * r, 0, math.sin(a) * r), false)
+        end
+        bioPart("TendonR", Vector3.new(0.06, origSize.Y * 0.95, 0.06), NERVE_C, Enum.Material.SmoothPlastic, nerveT, anchorPart, top * CFrame.new(origSize.X * 0.45, 0, origSize.Z * 0.15), false)
+        bioPart("TendonL", Vector3.new(0.06, origSize.Y * 0.95, 0.06), NERVE_C, Enum.Material.SmoothPlastic, nerveT, anchorPart, top * CFrame.new(-origSize.X * 0.45, 0, origSize.Z * 0.15), false)
+        bioPart("Artery", Vector3.new(0.05, origSize.Y * 0.95, 0.05), ARTERY_C, Enum.Material.SmoothPlastic, nerveT, anchorPart, top * CFrame.new(-origSize.X * 0.25, 0, 0), false)
+        bioPart("Vein", Vector3.new(0.05, origSize.Y * 0.95, 0.05), VEIN_C, Enum.Material.SmoothPlastic, nerveT, anchorPart, top * CFrame.new(origSize.X * 0.25, 0, 0), false)
+        task.wait(nerveT)
+
+        bioPart("Flesh", origSize * 0.96, FLESH_C, Enum.Material.SmoothPlastic, fleshT, anchorPart, top, false)
+        task.wait(fleshT)
+
+        for _, p in ipairs(parts) do
+            local finalSize = p.Size
+            p.Transparency = 0
+            p.LocalTransparencyModifier = 0
+            p.Color = origColor
+            p.Material = origMat
+            p.CanCollide = true
+            local startSize = finalSize * 0.1
+            p.Size = startSize
+            TweenService:Create(p, TweenInfo.new(skinT, Enum.EasingStyle.Sine, Enum.EasingDirection.Out), {
+                Size = finalSize
+            }):Play()
+        end
+
+        task.wait(skinT)
+        for _, child in ipairs(char:GetChildren()) do
+            if child.Name:sub(1, 4) == "Bio_" then child:Destroy() end
+        end
+        endPrintSound()
+        busyLimbs[groupName] = false
+    end)
+end
+
+local function fullRegen()
+    if isRegenerating then return end
+    isRegenerating = true
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not char or not hum then isRegenerating = false return end
+
+    hideBody(char)
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if root then playSoundAt(root, LAUGH_SOUND, 2, 1, false) end
+    busyLimbs = {}
+
+    local groups = {}
+    if hum.RigType == Enum.HumanoidRigType.R6 then
+        for name, parts in pairs(R6_LIMBS) do table.insert(groups, {name, parts}) end
+        table.insert(groups, {"Torso", TORSO_PARTS.R6})
+    else
+        for name, parts in pairs(R15_LIMBS) do table.insert(groups, {name, parts}) end
+        table.insert(groups, {"Torso", TORSO_PARTS.R15})
+    end
+
+    for _, g in ipairs(groups) do regeneratePart(g[1], g[2]) end
+    task.wait(REGEN_TIME + 2)
+    isRegenerating = false
+end
+
+local function handleDeath()
+    if deathActive then return end
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not char or not root then return end
+    deathActive = true
+    deathCFrame = root.CFrame
+    local rootPos = root.Position
+
+    local clones = {}
+    for _, obj in ipairs(char:GetDescendants()) do
+        if obj:IsA("BasePart") and obj.Name ~= "HumanoidRootPart" and obj.Transparency < 1 then
+            local c = obj:Clone()
+            for _, ch in ipairs(c:GetChildren()) do
+                if ch:IsA("Motor6D") or ch:IsA("JointInstance") then ch:Destroy() end
+            end
+            c.Anchored = false
+            c.CanCollide, c.CanTouch, c.CanQuery, c.Massless = true, false, false, true
+            c.Parent = workspace
+            local dir = (obj.Position - rootPos)
+            if dir.Magnitude < 0.05 then dir = Vector3.new(math.random() - 0.5, 0.5, math.random() - 0.5) end
+            dir = dir.Unit
+            c.AssemblyLinearVelocity = dir * (15 + math.random() * 15) + Vector3.new(0, 10 + math.random() * 12, 0)
+            c.AssemblyAngularVelocity = Vector3.new(math.random() * 24 - 12, math.random() * 24 - 12, math.random() * 24 - 12)
+            table.insert(clones, c)
+        end
+    end
+
+    hideBody(char)
+    task.delay(6, function()
+        for _, c in ipairs(clones) do if c and c.Parent then c:Destroy() end end
+    end)
+end
+
+local function setupCharacter(char)
+    local hum = char:WaitForChild("Humanoid", 5)
+    if not hum then return end
+    busyLimbs = {}
+    deathActive = false
+
+    hum.Died:Connect(function()
+        handleDeath()
+        task.spawn(function()
+            local newBody = nil
+            local conn = LocalPlayer.CharacterAdded:Connect(function(c) newBody = c end)
+            local t0 = os.clock()
+            while not newBody and os.clock() - t0 < 15 do task.wait(0.1) end
+            conn:Disconnect()
+            if not newBody then deathActive = false return end
+
+            for _, obj in ipairs(newBody:GetDescendants()) do
+                if obj:IsA("BasePart") and obj.Name ~= "HumanoidRootPart" then
+                    obj.Transparency = 1
+                    obj.CanCollide = false
+                    obj.LocalTransparencyModifier = 1
+                elseif obj:IsA("Decal") then
+                    obj.Transparency = 1
+                end
+            end
+
+            local nr = newBody:WaitForChild("HumanoidRootPart", 10)
+            if nr and deathCFrame then
+                task.wait(0.3) nr.CFrame = deathCFrame
+                task.wait(0.3) nr.CFrame = deathCFrame
+                task.wait(0.3) nr.CFrame = deathCFrame
+            end
+            task.wait(0.3)
+            fullRegen()
+            deathActive = false
+        end)
+    end)
+
+    local prevHP = hum.Health
+    hum.HealthChanged:Connect(function(newHP)
+        local tookDamage = newHP < prevHP
+        if tookDamage and newHP > 0 and AUTO_REGEN_DAMAGE and not deathActive and not isRegenerating then
+            local limbTable = (hum.RigType == Enum.HumanoidRigType.R6) and R6_LIMBS or R15_LIMBS
+            local allGroups = {}
+            for name, parts in pairs(limbTable) do table.insert(allGroups, {name, parts}) end
+            local torsoParts = (hum.RigType == Enum.HumanoidRigType.R6) and TORSO_PARTS.R6 or TORSO_PARTS.R15
+            table.insert(allGroups, {"Torso", torsoParts})
+
+            local free = {}
+            for _, g in ipairs(allGroups) do
+                if not busyLimbs[g[1]] then table.insert(free, g) end
+            end
+            if #free > 0 then
+                local chosen = free[math.random(1, #free)]
+                regeneratePart(chosen[1], chosen[2])
+            end
+        end
+        prevHP = newHP
+    end)
+end
+
+if LocalPlayer.Character then setupCharacter(LocalPlayer.Character) end
+LocalPlayer.CharacterAdded:Connect(setupCharacter)
+
+print("[Rick Prime] Загружено.")
