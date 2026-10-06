@@ -1,0 +1,671 @@
+--==================================================
+-- ЗАСТАВКА
+--==================================================
+task.spawn(function()
+	local plr = game:GetService("Players").LocalPlayer
+	local pgui
+	for i = 1, 30 do
+		pgui = plr:FindFirstChild("PlayerGui")
+		if pgui then break end
+		task.wait(0.1)
+	end
+	if not pgui then return end
+
+	local sg = Instance.new("ScreenGui")
+	sg.ResetOnSpawn = false
+	sg.IgnoreGuiInset = true
+	sg.Parent = pgui
+
+	local bg = Instance.new("Frame")
+	bg.Size = UDim2.new(1, 0, 1, 0)
+	bg.BackgroundColor3 = Color3.fromRGB(255, 215, 0)
+	bg.BorderSizePixel = 0
+	bg.Parent = sg
+
+	local t1 = Instance.new("TextLabel")
+	t1.Size = UDim2.new(1, 0, 0, 70)
+	t1.Position = UDim2.new(0, 0, 0.5, -70)
+	t1.BackgroundTransparency = 1
+	t1.Text = "Evil Morty Portal Gun"
+	t1.TextColor3 = Color3.fromRGB(0, 0, 0)
+	t1.TextStrokeColor3 = Color3.fromRGB(255, 255, 255)
+	t1.TextStrokeTransparency = 0.3
+	t1.TextSize = 40
+	t1.Font = Enum.Font.SourceSansBold
+	t1.Parent = sg
+
+	local t2 = Instance.new("TextLabel")
+	t2.Size = UDim2.new(1, 0, 0, 30)
+	t2.Position = UDim2.new(0, 0, 0.5, 30)
+	t2.BackgroundTransparency = 1
+	t2.Text = "By: Prime Scripts"
+	t2.TextColor3 = Color3.fromRGB(0, 0, 0)
+	t2.TextStrokeColor3 = Color3.fromRGB(255, 255, 255)
+	t2.TextStrokeTransparency = 0.3
+	t2.TextSize = 20
+	t2.Font = Enum.Font.SourceSansBold
+	t2.Parent = sg
+
+	local music = Instance.new("Sound")
+	music.SoundId = "rbxassetid://135276985140545"
+	music.Volume = 3
+	music.TimePosition = 36
+	music.Parent = workspace
+	music:Play()
+
+	task.wait(4)
+	music:Stop()
+	music:Destroy()
+	sg:Destroy()
+end)
+
+--==================================================
+-- ПУШКА + ПОРТАЛЫ + МЕНЮ
+--==================================================
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UIS = game:GetService("UserInputService")
+
+local LP = Players.LocalPlayer
+local cam = workspace.CurrentCamera
+
+local MESH_ID = "rbxassetid://18183178443"
+local TEX_ID  = "rbxassetid://18183193670"
+local PORTAL_DECAL = "120062250958572"
+local BG_PORTALS = "rbxassetid://8418743242"
+local BG_PLAYERS = "rbxassetid://8419242968"
+
+local C_YELLOW = Color3.fromRGB(255, 215, 0)
+local C_BEAM   = Color3.fromRGB(255, 220, 30)
+
+local GUN_SIZE = 1.78
+local BASE_GRIP = CFrame.new(0.03, 0.58, -0.52) * CFrame.Angles(math.rad(-107.71), math.rad(-4.50), math.rad(1.13))
+local PORTAL_SIZE = 7
+local PORTAL_OFFSET = 0.15
+
+local portalA, portalB = nil, nil
+local nextP = "A"
+local isTP = false
+local tool, meshPartRef = nil, nil
+local lastShot, tpCD = 0, 0
+
+local function isGunEquipped()
+	local char = LP.Character
+	if not char then return false end
+	local t = char:FindFirstChildOfClass("Tool")
+	return t ~= nil and t.Name == "PortalGun"
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "PortalGui"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.Parent = LP:WaitForChild("PlayerGui")
+
+local gunSound = Instance.new("Sound")
+gunSound.SoundId = "rbxassetid://1013378689"
+gunSound.Volume = 2.5
+gunSound.Parent = gui
+
+local portalSound = Instance.new("Sound")
+portalSound.SoundId = "rbxassetid://1013378689"
+portalSound.Volume = 1.5
+portalSound.Parent = gui
+
+local closeSound = Instance.new("Sound")
+closeSound.SoundId = "rbxassetid://1013378689"
+closeSound.Volume = 1.5
+closeSound.PlaybackSpeed = 0.8
+closeSound.Parent = gui
+
+local tpSound = Instance.new("Sound")
+tpSound.SoundId = "rbxassetid://1013378689"
+tpSound.Volume = 2
+tpSound.Parent = gui
+
+local function buildGun()
+	local t = Instance.new("Tool")
+	t.Name = "PortalGun"
+	t.RequiresHandle = true
+	t.CanBeDropped = false
+	t.Grip = BASE_GRIP
+	tool = t
+
+	local h = Instance.new("Part")
+	h.Name = "Handle"
+	h.Size = Vector3.new(0.5, 0.5, 0.5)
+	h.Transparency = 1
+	h.CanCollide = false
+	h.Massless = true
+	h.Parent = t
+
+	local meshPart = Instance.new("Part")
+	meshPart.Name = "PortalGunMesh"
+	meshPart.Size = Vector3.new(1, 1, 1)
+	meshPart.CanCollide = false
+	meshPart.Massless = true
+	meshPart.Parent = t
+	meshPartRef = meshPart
+
+	local mesh = Instance.new("SpecialMesh")
+	mesh.MeshType = Enum.MeshType.FileMesh
+	mesh.MeshId = MESH_ID
+	mesh.TextureId = TEX_ID
+	mesh.Scale = Vector3.new(GUN_SIZE, GUN_SIZE, GUN_SIZE)
+	mesh.Parent = meshPart
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Part0 = h
+	weld.Part1 = meshPart
+	weld.Parent = meshPart
+	meshPart.CFrame = h.CFrame * CFrame.new(0, 0, -1)
+
+	local gl = Instance.new("PointLight")
+	gl.Color = C_YELLOW
+	gl.Range = 8
+	gl.Brightness = 2
+	gl.Parent = meshPart
+
+	return t
+end
+
+local function giveGun()
+	local bp = LP:WaitForChild("Backpack")
+	if bp:FindFirstChild("PortalGun") then return end
+	buildGun().Parent = bp
+end
+
+LP.CharacterAdded:Connect(function()
+	task.wait(1)
+	giveGun()
+end)
+task.wait(2)
+giveGun()
+
+local function closePortalWithAnim(p)
+	if not p or not p.Parent then return end
+	local model = p.Parent
+	if not model:IsA("Model") then p:Destroy() return end
+	local ring
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("Part") and d.Shape == Enum.PartType.Cylinder then
+			ring = d
+			break
+		end
+	end
+
+	closeSound.TimePosition = 0
+	closeSound:Play()
+
+	if ring then
+		TweenService:Create(ring, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.In), {
+			Size = Vector3.new(0.5, 0.1, 0.1),
+			Transparency = 1
+		}):Play()
+		task.wait(0.35)
+	end
+	model:Destroy()
+end
+
+local function makePortal(pos, norm)
+	local model = Instance.new("Model")
+	model.Parent = workspace
+
+	local ring = Instance.new("Part")
+	ring.Shape = Enum.PartType.Cylinder
+	ring.Size = Vector3.new(0.5, 0.1, 0.1)
+	ring.Color = Color3.fromRGB(255, 255, 255)
+	ring.Anchored = true
+	ring.CanCollide = false
+
+	local up = Vector3.new(0, 1, 0)
+	if math.abs(norm.Y) > 0.95 then up = Vector3.new(0, 0, 1) end
+	local baseCF = CFrame.lookAt(pos + norm * PORTAL_OFFSET, pos + norm * PORTAL_OFFSET + norm, up) * CFrame.Angles(0, math.rad(-90), 0)
+	ring.CFrame = baseCF
+	ring.Parent = model
+
+	for _, face in ipairs({Enum.NormalId.Right, Enum.NormalId.Left, Enum.NormalId.Top, Enum.NormalId.Bottom, Enum.NormalId.Front, Enum.NormalId.Back}) do
+		local tex = Instance.new("Texture")
+		tex.Face = face
+		tex.Texture = "rbxassetid://" .. PORTAL_DECAL
+		tex.StudsPerTileU = 7
+		tex.StudsPerTileV = 7
+		tex.Parent = ring
+	end
+
+	TweenService:Create(ring, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+		Size = Vector3.new(0.5, PORTAL_SIZE, PORTAL_SIZE)
+	}):Play()
+
+	local core = Instance.new("Part")
+	core.Shape = Enum.PartType.Cylinder
+	core.Size = Vector3.new(1.5, PORTAL_SIZE * 0.85, PORTAL_SIZE * 0.85)
+	core.Transparency = 1
+	core.Anchored = true
+	core.CanCollide = false
+	core.CanTouch = true
+	core.CFrame = baseCF
+	core.Parent = model
+
+	core:SetAttribute("NX", norm.X)
+	core:SetAttribute("NY", norm.Y)
+	core:SetAttribute("NZ", norm.Z)
+
+	portalSound.TimePosition = 0
+	portalSound:Play()
+
+	local light = Instance.new("PointLight")
+	light.Color = C_YELLOW
+	light.Range = 25
+	light.Brightness = 5
+	light.Parent = core
+
+	return core
+end
+
+local function fireBeam(a, b)
+	local d = (a - b).Magnitude
+	if d < 0.01 then return end
+	local p = Instance.new("Part")
+	p.Shape = Enum.PartType.Cylinder
+	p.Size = Vector3.new(d, 0.25, 0.25)
+	p.Color = C_BEAM
+	p.Material = Enum.Material.Neon
+	p.Anchored = true
+	p.CanCollide = false
+	p.CFrame = CFrame.new(a, b) * CFrame.new(0, 0, -d/2) * CFrame.Angles(0, math.rad(90), 0)
+	p.Parent = workspace
+	task.spawn(function()
+		local t = 0
+		while t < 0.2 do
+			t += RunService.RenderStepped:Wait()
+			p.Transparency = t / 0.2
+		end
+		p:Destroy()
+	end)
+end
+
+local function checkTP()
+	if isTP then return end
+	if os.clock() - tpCD < 1.5 then return end
+
+	local char = LP.Character
+	if not char then return end
+	local root = char:FindFirstChild("HumanoidRootPart")
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not root then return end
+
+	local function inside(p)
+		if not p or not p.Parent then return false end
+		return (root.Position - p.Position).Magnitude < PORTAL_SIZE * 0.6
+	end
+
+	local ent, ext
+	if portalA and inside(portalA) then ent, ext = portalA, portalB
+	elseif portalB and inside(portalB) then ent, ext = portalB, portalA end
+	if not ent or not ext or not ext.Parent then return end
+
+	isTP = true
+	tpCD = os.clock()
+
+	tpSound.TimePosition = 0
+	tpSound:Play()
+
+	local n = Vector3.new(ext:GetAttribute("NX") or 0, ext:GetAttribute("NY") or 1, ext:GetAttribute("NZ") or 0)
+	local ep = ext.Position
+
+	if hum then
+		hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+		hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+		hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
+		hum:ChangeState(Enum.HumanoidStateType.Freefall)
+	end
+
+	local ip = ep + n * 0.5
+	local jd = (n + Vector3.new(0, 0.7, 0)).Unit
+	root.CFrame = CFrame.new(ip, ip + n)
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	root.AssemblyLinearVelocity = jd * 45 + Vector3.new(0, 22, 0)
+
+	task.spawn(function()
+		task.wait(1.2)
+		if hum and hum.Parent then
+			hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+			hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+			hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
+		end
+	end)
+
+	task.wait(0.8)
+	isTP = false
+end
+
+RunService.Heartbeat:Connect(checkTP)
+
+local function shoot()
+	if not isGunEquipped() then return end
+	if os.clock() - lastShot < 0.4 then return end
+	lastShot = os.clock()
+
+	gunSound.TimePosition = 0
+	gunSound:Play()
+
+	local mouse = LP:GetMouse()
+	local origin = cam.CFrame.Position
+	local dirVec = mouse.Hit.Position - origin
+	if dirVec.Magnitude < 0.01 then return end
+
+	local ignore = {tool}
+	if LP.Character then table.insert(ignore, LP.Character) end
+	if portalA then table.insert(ignore, portalA) end
+	if portalB then table.insert(ignore, portalB) end
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr.Character then table.insert(ignore, plr.Character) end
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignore
+
+	local res = workspace:Raycast(origin, dirVec.Unit * 1000, params)
+	if not res then return end
+
+	local hp = res.Position
+	local hn = res.Normal
+
+	if meshPartRef then
+		local muzzlePos = meshPartRef.Position + meshPartRef.CFrame.LookVector * -1.5
+		fireBeam(muzzlePos, hp)
+	end
+
+	if nextP == "A" then
+		task.spawn(function() if portalA then closePortalWithAnim(portalA) end end)
+		portalA = makePortal(hp, hn)
+		nextP = "B"
+	else
+		task.spawn(function() if portalB then closePortalWithAnim(portalB) end end)
+		portalB = makePortal(hp, hn)
+		nextP = "A"
+	end
+end
+
+local function teleportToPlayer(targetPlayer)
+	if not targetPlayer then return end
+	local char = targetPlayer.Character
+	if not char then return end
+	local targetRoot = char:FindFirstChild("HumanoidRootPart")
+	if not targetRoot then return end
+
+	local myChar = LP.Character
+	if not myChar then return end
+	local myRoot = myChar:FindFirstChild("HumanoidRootPart")
+	local hum = myChar:FindFirstChildOfClass("Humanoid")
+	if not myRoot then return end
+
+	local targetPos = targetRoot.Position + targetRoot.CFrame.RightVector * 5 + Vector3.new(0, 1, 0)
+	local norm = targetRoot.CFrame.RightVector
+	local tpPortal = makePortal(targetPos, norm)
+
+	tpSound.TimePosition = 0
+	tpSound:Play()
+
+	if hum then
+		hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+		hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+		hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
+		hum:ChangeState(Enum.HumanoidStateType.Freefall)
+	end
+
+	task.wait(0.35)
+
+	local landPos = targetRoot.Position + targetRoot.CFrame.RightVector * 4
+	myRoot.CFrame = CFrame.new(landPos, targetRoot.Position)
+	myRoot.AssemblyLinearVelocity = Vector3.zero
+	myRoot.AssemblyAngularVelocity = Vector3.zero
+
+	task.spawn(function()
+		task.wait(1.2)
+		if hum and hum.Parent then
+			hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+			hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+			hum:SetStateEnabled(Enum.HumanoidStateType.GettingUp, true)
+		end
+	end)
+
+	task.wait(1.5)
+	if tpPortal then closePortalWithAnim(tpPortal) end
+end
+
+local touchStartTime = 0
+local touchStartPos = Vector2.new(0, 0)
+local isTouching = false
+
+UIS.InputBegan:Connect(function(input, gpe)
+	if gpe then return end
+	if not isGunEquipped() then return end
+	if input.UserInputType == Enum.UserInputType.Touch then
+		touchStartTime = tick()
+		touchStartPos = input.Position
+		isTouching = true
+	elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
+		shoot()
+	end
+end)
+
+UIS.InputEnded:Connect(function(input, gpe)
+	if gpe then return end
+	if not isTouching then return end
+	if input.UserInputType == Enum.UserInputType.Touch then
+		if (tick() - touchStartTime) < 0.2 and (input.Position - touchStartPos).Magnitude < 15 then
+			shoot()
+		end
+		isTouching = false
+	end
+end)
+
+local menuBtn = Instance.new("TextButton")
+menuBtn.Size = UDim2.new(0, 60, 0, 60)
+menuBtn.Position = UDim2.new(0, 20, 0, 20)
+menuBtn.BackgroundColor3 = C_YELLOW
+menuBtn.Text = "☰"
+menuBtn.TextColor3 = Color3.fromRGB(0, 0, 0)
+menuBtn.TextSize = 30
+menuBtn.Font = Enum.Font.SourceSansBold
+menuBtn.ZIndex = 200
+menuBtn.Parent = gui
+local mbc = Instance.new("UICorner")
+mbc.CornerRadius = UDim.new(1, 0)
+mbc.Parent = menuBtn
+
+local menu = Instance.new("Frame")
+menu.Size = UDim2.new(0, 260, 0, 300)
+menu.Position = UDim2.new(0, 20, 0, 90)
+menu.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+menu.BorderSizePixel = 0
+menu.Visible = false
+menu.ZIndex = 50
+menu.Parent = gui
+local mc = Instance.new("UICorner")
+mc.CornerRadius = UDim.new(0, 12)
+mc.Parent = menu
+
+local bgImage = Instance.new("ImageLabel")
+bgImage.Size = UDim2.new(1, 0, 1, 0)
+bgImage.BackgroundTransparency = 1
+bgImage.Image = BG_PORTALS
+bgImage.ImageTransparency = 0.1
+bgImage.ScaleType = Enum.ScaleType.Stretch
+bgImage.ZIndex = 51
+bgImage.Parent = menu
+local bgCorner = Instance.new("UICorner")
+bgCorner.CornerRadius = UDim.new(0, 12)
+bgCorner.Parent = bgImage
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 30)
+title.BackgroundTransparency = 1
+title.Text = "ПОРТАЛ-МЕНЮ"
+title.TextColor3 = C_YELLOW
+title.TextStrokeTransparency = 0
+title.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+title.TextSize = 16
+title.Font = Enum.Font.SourceSansBold
+title.ZIndex = 52
+title.Parent = menu
+
+local tabFrame = Instance.new("Frame")
+tabFrame.Size = UDim2.new(1, -10, 0, 35)
+tabFrame.Position = UDim2.new(0, 5, 0, 32)
+tabFrame.BackgroundTransparency = 1
+tabFrame.ZIndex = 52
+tabFrame.Parent = menu
+
+local tabPortals = Instance.new("TextButton")
+tabPortals.Size = UDim2.new(0.5, -3, 1, 0)
+tabPortals.Position = UDim2.new(0, 0, 0, 0)
+tabPortals.BackgroundColor3 = C_YELLOW
+tabPortals.Text = "ПОРТАЛЫ"
+tabPortals.TextColor3 = Color3.fromRGB(0, 0, 0)
+tabPortals.TextSize = 14
+tabPortals.Font = Enum.Font.SourceSansBold
+tabPortals.ZIndex = 53
+tabPortals.Parent = tabFrame
+local tpc = Instance.new("UICorner")
+tpc.CornerRadius = UDim.new(0, 6)
+tpc.Parent = tabPortals
+
+local tabPlayers = Instance.new("TextButton")
+tabPlayers.Size = UDim2.new(0.5, -3, 1, 0)
+tabPlayers.Position = UDim2.new(0.5, 3, 0, 0)
+tabPlayers.BackgroundColor3 = Color3.fromRGB(60, 60, 65)
+tabPlayers.Text = "ИГРОКИ"
+tabPlayers.TextColor3 = Color3.fromRGB(255, 255, 255)
+tabPlayers.TextSize = 14
+tabPlayers.Font = Enum.Font.SourceSansBold
+tabPlayers.ZIndex = 53
+tabPlayers.Parent = tabFrame
+local tpc2 = Instance.new("UICorner")
+tpc2.CornerRadius = UDim.new(0, 6)
+tpc2.Parent = tabPlayers
+
+local pagePortals = Instance.new("Frame")
+pagePortals.Size = UDim2.new(1, -10, 0, 220)
+pagePortals.Position = UDim2.new(0, 5, 0, 72)
+pagePortals.BackgroundTransparency = 1
+pagePortals.ZIndex = 52
+pagePortals.Parent = menu
+
+local resetBtn = Instance.new("TextButton")
+resetBtn.Size = UDim2.new(1, 0, 0, 50)
+resetBtn.Position = UDim2.new(0, 0, 0, 10)
+resetBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+resetBtn.BackgroundTransparency = 0.1
+resetBtn.Text = "СБРОСИТЬ ПОРТАЛЫ"
+resetBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+resetBtn.TextStrokeTransparency = 0
+resetBtn.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+resetBtn.TextSize = 14
+resetBtn.Font = Enum.Font.SourceSansBold
+resetBtn.ZIndex = 53
+resetBtn.Parent = pagePortals
+local rbc = Instance.new("UICorner")
+rbc.CornerRadius = UDim.new(0, 8)
+rbc.Parent = resetBtn
+
+resetBtn.MouseButton1Click:Connect(function()
+	task.spawn(function()
+		if portalA then closePortalWithAnim(portalA) end
+		if portalB then closePortalWithAnim(portalB) end
+		portalA, portalB = nil, nil
+		nextP = "A"
+	end)
+end)
+
+local pagePlayers = Instance.new("ScrollingFrame")
+pagePlayers.Size = UDim2.new(1, -10, 0, 220)
+pagePlayers.Position = UDim2.new(0, 5, 0, 72)
+pagePlayers.BackgroundTransparency = 1
+pagePlayers.Visible = false
+pagePlayers.ScrollBarThickness = 6
+pagePlayers.CanvasSize = UDim2.new(0, 0, 0, 0)
+pagePlayers.AutomaticCanvasSize = Enum.AutomaticSize.Y
+pagePlayers.ZIndex = 52
+pagePlayers.Parent = menu
+
+local layout = Instance.new("UIListLayout")
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Padding = UDim.new(0, 4)
+layout.Parent = pagePlayers
+
+local function refreshPlayerList()
+	for _, child in ipairs(pagePlayers:GetChildren()) do
+		if child:IsA("TextButton") then child:Destroy() end
+	end
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LP then
+			local btn = Instance.new("TextButton")
+			btn.Size = UDim2.new(1, -8, 0, 40)
+			btn.BackgroundColor3 = Color3.fromRGB(50, 50, 55)
+			btn.BackgroundTransparency = 0.3
+			btn.Text = "→ " .. plr.Name
+			btn.TextColor3 = C_YELLOW
+			btn.TextStrokeTransparency = 0
+			btn.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+			btn.TextSize = 14
+			btn.Font = Enum.Font.SourceSansBold
+			btn.ZIndex = 53
+			btn.Parent = pagePlayers
+			local bc = Instance.new("UICorner")
+			bc.CornerRadius = UDim.new(0, 6)
+			bc.Parent = btn
+
+			btn.MouseButton1Click:Connect(function()
+				teleportToPlayer(plr)
+				menu.Visible = false
+			end)
+		end
+	end
+end
+
+tabPortals.MouseButton1Click:Connect(function()
+	pagePortals.Visible = true
+	pagePlayers.Visible = false
+	bgImage.Image = BG_PORTALS
+	tabPortals.BackgroundColor3 = C_YELLOW
+	tabPortals.TextColor3 = Color3.fromRGB(0, 0, 0)
+	tabPlayers.BackgroundColor3 = Color3.fromRGB(60, 60, 65)
+	tabPlayers.TextColor3 = Color3.fromRGB(255, 255, 255)
+end)
+
+tabPlayers.MouseButton1Click:Connect(function()
+	pagePortals.Visible = false
+	pagePlayers.Visible = true
+	bgImage.Image = BG_PLAYERS
+	tabPortals.BackgroundColor3 = Color3.fromRGB(60, 60, 65)
+	tabPortals.TextColor3 = Color3.fromRGB(255, 255, 255)
+	tabPlayers.BackgroundColor3 = C_YELLOW
+	tabPlayers.TextColor3 = Color3.fromRGB(0, 0, 0)
+	refreshPlayerList()
+end)
+
+menuBtn.MouseButton1Click:Connect(function()
+	menu.Visible = not menu.Visible
+	if menu.Visible and pagePlayers.Visible then
+		refreshPlayerList()
+	end
+end)
+
+Players.PlayerAdded:Connect(function()
+	if menu.Visible and pagePlayers.Visible then refreshPlayerList() end
+end)
+Players.PlayerRemoving:Connect(function()
+	if menu.Visible and pagePlayers.Visible then refreshPlayerList() end
+end)
+
+LP.CharacterAdded:Connect(function()
+	if portalA then portalA:Destroy() portalA = nil end
+	if portalB then portalB:Destroy() portalB = nil end
+end)
