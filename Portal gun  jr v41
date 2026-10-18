@@ -1,0 +1,509 @@
+-- ================= НАСТРОЙКИ ПОРТАЛА =================
+local TOOL_NAME  = "Toy portal gun"
+local MESH_ID    = "rbxassetid://71503977742696"
+local TEXTURE_ID = "rbxassetid://75877697777323"
+
+-- ИКОНКИ И ФОНЫ
+local ICON_GUN    = "rbxassetid://92700744374759" 
+local BG_FIRE     = "rbxassetid://16463014566"    
+local BG_RESET    = "rbxassetid://81558332228414" 
+local ICON_GLASSES = "rbxassetid://126738054801557"
+
+local PORTAL_MESH    = "rbxassetid://113206648303948"
+local PORTAL_TEXTURE = "rbxassetid://84300011755527"
+local BALL_COLOR     = Color3.fromRGB(20, 150, 20)
+local PORTAL_COLOR   = Color3.fromRGB(57, 255, 20) 
+
+local PORTAL_SIZE = 1.8 -- Увеличенный портал
+local ROT_X = 0
+local ROT_Y = 40.3
+local ROT_Z = 90
+local SPIN_SPEED = 60 
+
+local MAX_PORTALS  = 2
+local MAX_DIST     = 5000
+local BALL_SPEED   = 250
+
+local SOUND_OPEN  = "rbxassetid://1013378689"
+local SOUND_ENTER = "rbxassetid://1013378689"
+local SOUND_CLOSE = "rbxassetid://1013378689"
+
+-- ================= НАСТРОЙКИ ОЧКОВ =================
+local GLASSES_NAME    = "Очки"
+local GLASSES_MESH    = "rbxassetid://117206222819900"
+local GLASSES_TEXTURE = "rbxassetid://114870763513064"
+
+-- ================= ПЕРЕМЕННЫЕ =================
+local plr = game.Players.LocalPlayer
+local RunService  = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Camera      = workspace.CurrentCamera
+local plrGui      = plr:WaitForChild("PlayerGui")
+
+local portals = {}
+local lastTeleport = 0
+local teleporting = false
+local isEquippedGlasses = false
+local weaponHandle = nil 
+
+local shiftLockEnabled = false
+
+-- ================= ЗВУК =================
+local function playSound(id, pos, vol, pitch)
+    local s = Instance.new("Part")
+    s.Anchored = true
+    s.CanCollide = false
+    s.Transparency = 1
+    s.Size = Vector3.new(0.1, 0.1, 0.1)
+    s.CFrame = CFrame.new(pos)
+    s.Parent = workspace
+    local sound = Instance.new("Sound")
+    sound.SoundId = id
+    sound.Volume = vol or 1.5
+    sound.PlaybackSpeed = pitch or 1
+    sound.Parent = s
+    sound:Play()
+    sound.Ended:Connect(function() s:Destroy() end)
+    task.delay(10, function() if s then s:Destroy() end end)
+end
+
+-- ================= SHIFT LOCK (ДЛЯ ТЕЛА) =================
+RunService.RenderStepped:Connect(function()
+    local char = plr.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then return end
+
+    if shiftLockEnabled then
+        hum.AutoRotate = false
+        local camDir = Camera.CFrame.LookVector
+        local flatDir = Vector3.new(camDir.X, 0, camDir.Z).Unit
+        
+        if flatDir.Magnitude > 0 then
+            local targetCFrame = CFrame.lookAt(hrp.Position, hrp.Position + flatDir)
+            hrp.CFrame = hrp.CFrame:Lerp(targetCFrame, 0.3)
+        end
+    else
+        hum.AutoRotate = true
+    end
+end)
+
+-- ================= ЭФФЕКТ РАЗМЫТИЯ =================
+local blur = Instance.new("BlurEffect")
+blur.Size = 15 
+blur.Parent = game:GetService("Lighting")
+
+-- ================= ОЧКИ =================
+local function wearGlasses()
+    if isEquippedGlasses then return end
+    isEquippedGlasses = true
+    TweenService:Create(blur, TweenInfo.new(1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Size = 0 }):Play()
+    
+    local char = plr.Character
+    if char then
+        local head = char:FindFirstChild("Head")
+        if head then
+            if head:FindFirstChild("MyGlasses") then head.MyGlasses:Destroy() end
+            local g = Instance.new("MeshPart")
+            g.Name = "MyGlasses"
+            g.MeshId = GLASSES_MESH
+            g.TextureID = GLASSES_TEXTURE
+            g.Size = Vector3.new(1, 1, 1) 
+            g.CanCollide = false
+            g.Massless = true
+            g.Anchored = true 
+            
+            g.CFrame = head.CFrame * CFrame.new(0, 0.1, -5) 
+            g.Parent = head
+
+            local targetCF = head.CFrame * CFrame.new(0, 0.1, -0.15) * CFrame.Angles(0, math.rad(180), 0)
+            TweenService:Create(g, TweenInfo.new(0.8, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { CFrame = targetCF }):Play()
+
+            task.delay(0.8, function()
+                if g and g.Parent then
+                    g.Anchored = false
+                    local weld = Instance.new("Weld")
+                    weld.Part0 = head
+                    weld.Part1 = g
+                    weld.C0 = CFrame.new(0, 0.1, -0.15) * CFrame.Angles(0, math.rad(180), 0)
+                    weld.Parent = g
+                end
+            end)
+        end
+    end
+end
+
+-- ================= UI =================
+local ui = Instance.new("ScreenGui")
+ui.Name = "MainUI"
+ui.ResetOnSpawn = false
+ui.Parent = plrGui
+
+-- Кнопка "Надеть очки"
+local wearBtn = Instance.new("TextButton")
+wearBtn.Size = UDim2.new(0, 200, 0, 50)
+wearBtn.Position = UDim2.new(0.5, -100, 0.5, 0) 
+wearBtn.BackgroundColor3 = Color3.fromRGB(0, 150, 255)
+wearBtn.Text = "👓 НАДЕТЬ ОЧКИ"
+wearBtn.TextColor3 = Color3.new(1,1,1)
+wearBtn.Font = Enum.Font.GothamBold
+wearBtn.TextSize = 18
+wearBtn.Visible = false
+wearBtn.Parent = ui
+Instance.new("UICorner", wearBtn).CornerRadius = UDim.new(0, 8)
+
+wearBtn.MouseButton1Click:Connect(function()
+    wearGlasses()
+    wearBtn.Visible = false
+    local char = plr.Character
+    if char and char:FindFirstChild(GLASSES_NAME) then char[GLASSES_NAME]:Destroy() end
+end)
+
+-- Кнопка ВЫСТРЕЛА
+local fireBtn = Instance.new("TextButton")
+fireBtn.Size = UDim2.new(0, 70, 0, 70)
+fireBtn.Position = UDim2.new(1, -90, 0.5, -35) 
+fireBtn.BackgroundColor3 = Color3.new(1,1,1)
+fireBtn.Text = "" 
+fireBtn.AutoButtonColor = true
+fireBtn.Parent = ui
+Instance.new("UICorner", fireBtn).CornerRadius = UDim.new(1, 0)
+
+local fireImg = Instance.new("ImageLabel")
+fireImg.Size = UDim2.new(1, 0, 1, 0)
+fireImg.BackgroundTransparency = 1
+fireImg.Image = BG_FIRE
+fireImg.Parent = fireBtn
+Instance.new("UICorner", fireImg).CornerRadius = UDim.new(1, 0)
+
+-- Кнопка RESET
+local resetBtn = Instance.new("TextButton")
+resetBtn.Size = UDim2.new(0, 70, 0, 35)
+resetBtn.Position = UDim2.new(1, -90, 0.5, -95) 
+resetBtn.BackgroundColor3 = Color3.new(1,1,1)
+resetBtn.Text = "" 
+resetBtn.AutoButtonColor = true
+resetBtn.Parent = ui
+Instance.new("UICorner", resetBtn).CornerRadius = UDim.new(0, 10)
+
+local resetImg = Instance.new("ImageLabel")
+resetImg.Size = UDim2.new(1, 0, 1, 0)
+resetImg.BackgroundTransparency = 1
+resetImg.Image = BG_RESET
+resetImg.Parent = resetBtn
+Instance.new("UICorner", resetImg).CornerRadius = UDim.new(0, 10)
+
+-- КНОПКА SHIFT LOCK (БЕЛАЯ, КРУГЛАЯ, СЛЕВА ОТ ВЫСТРЕЛА)
+local shiftBtn = Instance.new("TextButton")
+shiftBtn.Size = UDim2.new(0, 50, 0, 50)
+shiftBtn.Position = UDim2.new(1, -155, 0.5, -55) 
+shiftBtn.BackgroundColor3 = Color3.fromRGB(255, 255, 255) -- Белый фон
+shiftBtn.Text = "🔓"
+shiftBtn.TextColor3 = Color3.fromRGB(0, 0, 0) -- Черный значок
+shiftBtn.Font = Enum.Font.GothamBold
+shiftBtn.TextSize = 24
+shiftBtn.Parent = ui
+Instance.new("UICorner", shiftBtn).CornerRadius = UDim.new(1, 0) 
+
+shiftBtn.MouseButton1Click:Connect(function()
+    shiftLockEnabled = not shiftLockEnabled
+    if shiftLockEnabled then
+        shiftBtn.Text = "🔒"
+        shiftBtn.BackgroundColor3 = Color3.fromRGB(0, 200, 0) -- Зеленый при включении
+        shiftBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    else
+        shiftBtn.Text = "🔓"
+        shiftBtn.BackgroundColor3 = Color3.fromRGB(255, 255, 255) -- Белый при выключении
+        shiftBtn.TextColor3 = Color3.fromRGB(0, 0, 0)
+    end
+end)
+
+-- ================= ИНВЕНТАРЬ =================
+local function setupInventory()
+    local backpack = plr:WaitForChild("Backpack")
+    local char = plr.Character
+    if not char then return end
+
+    for _, v in ipairs(backpack:GetChildren()) do
+        if v.Name == TOOL_NAME or v.Name == GLASSES_NAME then v:Destroy() end
+    end
+    for _, v in ipairs(char:GetChildren()) do
+        if v.Name == TOOL_NAME or v.Name == GLASSES_NAME then v:Destroy() end
+    end
+
+    -- ПУШКА
+    local tool = Instance.new("Tool")
+    tool.Name = TOOL_NAME
+    tool.RequiresHandle = true
+    tool.TextureId = ICON_GUN
+
+    local handle = Instance.new("MeshPart")
+    handle.Name = "Handle"
+    handle.MeshId = MESH_ID
+    handle.TextureID = TEXTURE_ID
+    handle.Size = Vector3.new(1, 1, 1)
+    handle.CanCollide = false
+    handle.Parent = tool
+    tool.Parent = backpack
+
+    tool.Equipped:Connect(function() weaponHandle = handle end)
+    tool.Unequipped:Connect(function() weaponHandle = nil end)
+
+    -- ОЧКИ
+    local glassesTool = Instance.new("Tool")
+    glassesTool.Name = GLASSES_NAME
+    glassesTool.RequiresHandle = false
+    glassesTool.TextureId = ICON_GLASSES
+    glassesTool.Parent = backpack
+
+    glassesTool.Equipped:Connect(function() wearBtn.Visible = true end)
+    glassesTool.Unequipped:Connect(function() wearBtn.Visible = false end)
+end
+
+setupInventory()
+
+plr.CharacterAdded:Connect(function()
+    task.wait(1)
+    isEquippedGlasses = false
+    blur.Size = 15
+    setupInventory()
+end)
+
+-- ================= GRIP =================
+RunService.RenderStepped:Connect(function()
+    local c = plr.Character
+    if not c then return end
+    local arm = c:FindFirstChild("RightHand") or c:FindFirstChild("Right Arm")
+    if not arm then return end
+    for _, w in ipairs(arm:GetChildren()) do
+        if w:IsA("Weld") and (w.Name == "RightGrip" or w.Name == "RightGripWeld") then
+            if w.Part1 and w.Part1.Name == "Handle" and w.Part1.Parent and w.Part1.Parent.Name == TOOL_NAME then
+                w.C0 = CFrame.new(0, -1.48, -0.72) * CFrame.Angles(math.rad(-87.92), math.rad(91.38), math.rad(-3.46))
+            end
+        end
+    end
+end)
+
+-- ================= ВСПЫШКА =================
+local flashGui = Instance.new("ScreenGui")
+flashGui.Name = "PortalFlash"
+flashGui.ResetOnSpawn = false
+flashGui.IgnoreGuiInset = true
+flashGui.DisplayOrder = 999
+flashGui.Parent = plrGui
+
+local flashFrame = Instance.new("Frame")
+flashFrame.Size = UDim2.new(1, 0, 1, 0)
+flashFrame.BackgroundColor3 = PORTAL_COLOR
+flashFrame.BackgroundTransparency = 1
+flashFrame.BorderSizePixel = 0
+flashFrame.ZIndex = 999
+flashFrame.Parent = flashGui
+
+local function screenFlash()
+    flashFrame.BackgroundTransparency = 0
+    TweenService:Create(flashFrame, TweenInfo.new(0.5), { BackgroundTransparency = 1 }):Play()
+end
+
+-- ================= ВРАЩЕНИЕ =================
+local spinList = {}
+RunService.Heartbeat:Connect(function(dt)
+    for i, data in ipairs(spinList) do
+        if data.portal and data.portal.Parent then
+            data.angle = data.angle - math.rad(SPIN_SPEED) * dt 
+            data.portal.CFrame = data.baseCF * CFrame.Angles(0, data.angle, 0) * data.rot
+        else
+            table.remove(spinList, i)
+        end
+    end
+end)
+
+-- ================= ИСКАЖЕНИЕ =================
+local function distortOnce()
+    for _, p in ipairs(portals) do
+        if p and p.Parent then
+            spawn(function()
+                if not p.Parent then return end
+                TweenService:Create(p, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {
+                    Size = Vector3.new(PORTAL_SIZE, PORTAL_SIZE * 0.05, PORTAL_SIZE * 0.05) 
+                }):Play()
+                task.wait(0.2)
+                if p and p.Parent then
+                    TweenService:Create(p, TweenInfo.new(0.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {
+                        Size = Vector3.new(PORTAL_SIZE, PORTAL_SIZE, PORTAL_SIZE)
+                    }):Play()
+                end
+            end)
+        end
+    end
+end
+
+-- ================= ТЕЛЕПОРТ =================
+local function teleport(entered, exit)
+    if teleporting then return end
+    teleporting = true
+
+    local c = plr.Character
+    if not c then teleporting = false return end
+    local hrp = c:FindFirstChild("HumanoidRootPart")
+    local hum = c:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then teleporting = false return end
+
+    playSound(SOUND_ENTER, hrp.Position, 1.5)
+    screenFlash()
+    distortOnce()
+
+    local exitNormal = exit.CFrame.LookVector
+    local outPos = exit.Position + exitNormal * 3 + Vector3.new(0, 1, 0)
+    local newCF = CFrame.lookAt(outPos, outPos + exitNormal)
+    
+    for _, part in ipairs(c:GetDescendants()) do
+        if part:IsA("BasePart") then part.CanCollide = false end
+    end
+
+    c:PivotTo(newCF)
+    
+    task.delay(0.15, function()
+        if c and c.Parent then
+            for _, part in ipairs(c:GetDescendants()) do
+                if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+                    part.CanCollide = true
+                end
+            end
+        end
+    end)
+
+    hum:ChangeState(Enum.HumanoidStateType.Jumping)
+    hrp.AssemblyLinearVelocity = Vector3.new(exitNormal.X * 40, 65, exitNormal.Z * 40)
+    
+    task.wait(1.5) 
+    teleporting = false
+end
+
+-- ================= ВЫСТРЕЛ =================
+local function fire()
+    local c = plr.Character
+    if not c then return end
+    
+    if not weaponHandle or not weaponHandle.Parent or not weaponHandle.Parent:IsA("Tool") then return end
+    local isHeld = false
+    for _, w in ipairs(c:GetDescendants()) do
+        if w:IsA("Weld") and w.Part1 == weaponHandle then isHeld = true break end
+    end
+    if not isHeld then return end
+
+    local startPos = weaponHandle.Position
+    local origin = Camera.CFrame.Position
+    local dir = Camera.CFrame.LookVector
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {c}
+    for _, p in ipairs(portals) do table.insert(params.FilterDescendantsInstances, p) end
+
+    local direct = workspace:Raycast(origin, dir * MAX_DIST, params)
+    local targetPos = direct and direct.Position or (origin + dir * MAX_DIST)
+
+    local ball = Instance.new("Part")
+    ball.Shape = Enum.PartType.Ball
+    ball.Size = Vector3.new(1.5, 1.5, 1.5)
+    ball.Material = Enum.Material.Neon
+    ball.Color = BALL_COLOR
+    ball.CanCollide = false
+    ball.Anchored = true
+    ball.CFrame = CFrame.new(startPos)
+    ball.Parent = workspace
+
+    local dist = (targetPos - startPos).Magnitude
+    local duration = math.max(dist / BALL_SPEED, 0.1)
+    local t0 = tick()
+
+    spawn(function()
+        while tick() - t0 < duration do
+            local t = (tick() - t0) / duration
+            ball.CFrame = CFrame.new(startPos:Lerp(targetPos, t))
+            RunService.RenderStepped:Wait()
+        end
+
+        ball:Destroy()
+        if not direct then return end
+
+        if #portals >= MAX_PORTALS then
+            local old = table.remove(portals, 1)
+            old:Destroy()
+        end
+
+        local portal = Instance.new("MeshPart")
+        portal.MeshId = PORTAL_MESH
+        portal.TextureID = PORTAL_TEXTURE
+        portal.Anchored = true
+        portal.CanCollide = false
+        portal.Material = Enum.Material.Neon
+        portal.Color = PORTAL_COLOR
+        portal.Transparency = 0
+        portal.CanQuery = false
+        portal.CanTouch = true
+
+        local up = Vector3.new(0, 1, 0)
+        if math.abs(direct.Normal:Dot(up)) > 0.99 then up = Vector3.new(0, 0, 1) end
+        local right = direct.Normal:Cross(up).Unit
+        local forward = right:Cross(direct.Normal).Unit
+        
+        local baseCF = CFrame.fromMatrix(direct.Position + direct.Normal * 0.2, right, direct.Normal, forward)
+        local rot = CFrame.Angles(math.rad(ROT_X), math.rad(ROT_Y), math.rad(ROT_Z))
+        
+        portal.CFrame = baseCF * rot
+        portal.Parent = workspace
+        
+        table.insert(portals, portal)
+        table.insert(spinList, { portal = portal, baseCF = baseCF, rot = rot, angle = 0 })
+
+        playSound(SOUND_OPEN, direct.Position, 1.5)
+
+        portal.Size = Vector3.new(PORTAL_SIZE, PORTAL_SIZE * 0.1, PORTAL_SIZE * 0.1)
+        TweenService:Create(portal, TweenInfo.new(0.6, Enum.EasingStyle.Elastic, Enum.EasingDirection.Out), {
+            Size = Vector3.new(PORTAL_SIZE, PORTAL_SIZE, PORTAL_SIZE)
+        }):Play()
+    end)
+end
+
+fireBtn.MouseButton1Click:Connect(fire)
+
+resetBtn.MouseButton1Click:Connect(function()
+    for _, p in ipairs(portals) do
+        if p and p.Parent then
+            playSound(SOUND_CLOSE, p.Position, 1.5, 0.7)
+            TweenService:Create(p, TweenInfo.new(0.5), { Size = Vector3.new(0,0,0), Transparency = 1 }):Play()
+            task.delay(0.5, function() if p then p:Destroy() end end)
+        end
+    end
+    portals = {}
+    spinList = {}
+end)
+
+-- ================= ТЕЛЕПОРТ С КРАЯ =================
+RunService.Heartbeat:Connect(function()
+    if #portals < 2 then return end
+    if teleporting then return end
+    if tick() - lastTeleport < 2 then return end
+
+    local c = plr.Character
+    if not c then return end
+    local hrp = c:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    for i, portal in ipairs(portals) do
+        if portal and portal.Parent then
+            if (hrp.Position - portal.Position).Magnitude < PORTAL_SIZE * 4 then
+                local other = (i == 1) and portals[2] or portals[1]
+                if other and other.Parent then
+                    lastTeleport = tick()
+                    teleport(portal, other)
+                    return
+                end
+            end
+        end
+    end
+end)
+
+print("✅ v49: Белая кнопка Shift Lock, сдвинута левее и выше выстрела.")
