@@ -1,0 +1,1064 @@
+--[[
+    OCTO ARMS  |  Delta / Roblox
+    4 технологических щупальца из спины (как у Доктора Осьминога)
+    - щупальца выезжают из спины / уезжают обратно
+    - ходьба: щупальца-лапы шагают и несут тебя
+    - ползание по стенам и потолкам
+    - скорость и количество щупалец
+    Меню: перетаскивается, сворачивается кнопкой "–", RightShift - скрыть/показать
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+local ENV = (getgenv and getgenv()) or _G
+
+if ENV.__OCTO and ENV.__OCTO.destroy then
+	pcall(ENV.__OCTO.destroy)
+end
+
+----------------------------------------------------------------
+-- НАСТРОЙКИ
+----------------------------------------------------------------
+local SEGS = 9            -- сегментов в щупальце
+local SEG_LEN = 1.2       -- длина сегмента
+local HOVER = 5.8         -- высота корпуса над поверхностью
+local HIPADD = 2.8        -- на сколько щупальца поднимают тело на земле
+
+local MOUNTS = {          -- точки крепления на спине (локально к торсу, +Z = спина)
+	Vector3.new(0.55, 0.7, 0.6),
+	Vector3.new(-0.55, 0.7, 0.6),
+	Vector3.new(0.35, -0.5, 0.6),
+	Vector3.new(-0.35, -0.5, 0.6),
+}
+local FOOT = {            -- куда щупальце хочет ставить "лапу" {вправо, вперёд}
+	{ 4.5, 2.0 },
+	{ -4.5, 2.0 },
+	{ 3.8, -3.4 },
+	{ -3.8, -3.4 },
+}
+local NEIGH = { { 2, 3 }, { 1, 4 }, { 1, 4 }, { 2, 3 } } -- чтобы диагонали шагали вместе
+
+local S = { tent = false, walk = false, wall = false, speed = 3, count = 4 }
+
+----------------------------------------------------------------
+-- УТИЛИТЫ
+----------------------------------------------------------------
+local Y = Vector3.new(0, 1, 0)
+local ZERO = Vector3.new(0, 0, 0)
+
+local function safeUnit(v, fb)
+	local m = v.Magnitude
+	if m < 1e-4 then
+		return fb or Y
+	end
+	return v / m
+end
+local function proj(v, n)
+	return v - n * v:Dot(n)
+end
+local function smooth(t)
+	t = math.clamp(t, 0, 1)
+	return t * t * (3 - 2 * t)
+end
+local function easeOutBack(x)
+	x = math.clamp(x, 0, 1)
+	local c1 = 1.70158
+	local c3 = c1 + 1
+	return 1 + c3 * (x - 1) ^ 3 + c1 * (x - 1) ^ 2
+end
+local function new(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do
+		o[k] = v
+	end
+	if parent then
+		o.Parent = parent
+	end
+	return o
+end
+
+local conns = {}
+local function connect(sig, fn)
+	local c = sig:Connect(fn)
+	table.insert(conns, c)
+	return c
+end
+
+----------------------------------------------------------------
+-- ПЕРСОНАЖ
+----------------------------------------------------------------
+local char, hum, root, torso, animate
+local origHip, origSpeed = 2, 16
+local curAdd, hipDirty = 0, false
+local lastWant = false
+local lastPos = ZERO
+local vel = ZERO
+
+local rp = RaycastParams.new()
+rp.FilterType = Enum.RaycastFilterType.Exclude
+rp.IgnoreWater = true
+local function cast(o, d)
+	return Workspace:Raycast(o, d, rp)
+end
+
+local folder = new("Folder", { Name = "OctoArmsFx" })
+pcall(function()
+	folder.Parent = Workspace.CurrentCamera
+end)
+if not folder.Parent then
+	folder.Parent = Workspace
+end
+
+local function valid()
+	return char and char.Parent and hum and hum.Parent and root and root.Parent and torso and torso.Parent and hum.Health > 0
+end
+
+local function setAnim(on)
+	pcall(function()
+		if animate then
+			animate.Disabled = not on
+		end
+		if not on and hum then
+			local animator = hum:FindFirstChildOfClass("Animator")
+			if animator then
+				for _, t in ipairs(animator:GetPlayingAnimationTracks()) do
+					t:Stop(0.1)
+				end
+			end
+		end
+	end)
+end
+
+----------------------------------------------------------------
+-- ЩУПАЛЬЦА (детали)
+----------------------------------------------------------------
+local C_SEG = Color3.fromRGB(48, 52, 62)
+local C_JOINT = Color3.fromRGB(255, 122, 31)
+local C_PRONG = Color3.fromRGB(170, 176, 190)
+
+local function mkPart(shape, color, mat)
+	return new("Part", {
+		Anchored = true,
+		CanCollide = false,
+		CanQuery = false,
+		CanTouch = false,
+		Massless = true,
+		Shape = shape,
+		Material = mat,
+		Color = color,
+		TopSurface = Enum.SurfaceType.Smooth,
+		BottomSurface = Enum.SurfaceType.Smooth,
+		Size = Vector3.new(0.2, 0.2, 0.2),
+		Transparency = 1,
+	}, folder)
+end
+
+local legs = {}
+local function buildLeg(i)
+	local L = {
+		i = i,
+		ext = 0,
+		e = 0,
+		delay = 0,
+		lastGoal = nil,
+		vis = false,
+		init = false,
+		pts = {},
+		segs = {},
+		joints = {},
+		prongs = {},
+		tip = ZERO,
+		tipVel = ZERO,
+		foot = ZERO,
+		stepping = false,
+		stepT = 0,
+		stepS = ZERO,
+		stepE = ZERO,
+		wasWalking = false,
+		open = 0.22,
+	}
+	for k = 1, SEGS do
+		L.segs[k] = mkPart(Enum.PartType.Cylinder, C_SEG, Enum.Material.Metal)
+	end
+	for k = 1, SEGS + 1 do
+		L.joints[k] = mkPart(Enum.PartType.Ball, C_JOINT, Enum.Material.Neon)
+	end
+	for k = 1, 2 do
+		L.prongs[k] = mkPart(Enum.PartType.Block, C_PRONG, Enum.Material.Metal)
+	end
+	legs[i] = L
+end
+for i = 1, 4 do
+	buildLeg(i)
+end
+
+-- пластина на спине
+local plate = mkPart(Enum.PartType.Block, Color3.fromRGB(34, 36, 44), Enum.Material.Metal)
+local core = mkPart(Enum.PartType.Block, C_JOINT, Enum.Material.Neon)
+local plateVis = false
+
+local function setVis(L, v)
+	if L.vis == v then
+		return
+	end
+	L.vis = v
+	local tr = v and 0 or 1
+	for _, p in ipairs(L.segs) do
+		p.Transparency = tr
+	end
+	for _, p in ipairs(L.joints) do
+		p.Transparency = tr
+	end
+	for _, p in ipairs(L.prongs) do
+		p.Transparency = tr
+	end
+end
+local function setPlateVis(v)
+	if plateVis == v then
+		return
+	end
+	plateVis = v
+	plate.Transparency = v and 0 or 1
+	core.Transparency = v and 0 or 1
+end
+
+-- списки для BulkMoveTo
+local RP, RC, rn = {}, {}, 0
+local function add(part, cf)
+	rn += 1
+	RP[rn] = part
+	RC[rn] = cf
+end
+
+----------------------------------------------------------------
+-- ШАГИ / IK
+----------------------------------------------------------------
+local function idealFoot(L, c, lead)
+	local f = FOOT[L.i]
+	local o = c.rootPos + c.right * f[1] + c.fwd * f[2] + lead
+	local hit = cast(o + c.up * 3, -c.up * (HOVER + 12))
+	if hit then
+		return hit.Position
+	end
+	return o - c.up * HOVER
+end
+
+local function updateLeg(L, c)
+	local i, dt = L.i, c.dt
+	local active = S.tent and i <= S.count
+	local goal = active and 1 or 0
+	if L.lastGoal ~= goal then
+		L.lastGoal = goal
+		L.delay = active and (i - 1) * 0.1 or (4 - i) * 0.07
+	end
+	if L.delay > 0 then
+		L.delay -= dt
+	else
+		if L.ext < goal then
+			L.ext = math.min(goal, L.ext + dt * 2.2)
+		elseif L.ext > goal then
+			L.ext = math.max(goal, L.ext - dt * 2.6)
+		end
+	end
+	local e = (goal == 1) and easeOutBack(L.ext) or smooth(L.ext)
+	L.e = e
+
+	local mount = torso.CFrame:PointToWorldSpace(MOUNTS[i])
+	local n = SEGS + 1
+	local pts = L.pts
+
+	if not L.init then
+		for k = 1, n do
+			pts[k] = mount
+		end
+		L.tip, L.tipVel, L.foot, L.init = mount, ZERO, mount, true
+	end
+
+	if L.ext <= 0.001 and goal == 0 then
+		setVis(L, false)
+		for k = 1, n do
+			pts[k] = mount
+		end
+		L.tip, L.tipVel = mount, ZERO
+		L.wasWalking = false
+		L.stepping = false
+		return
+	end
+	setVis(L, true)
+
+	-- целевая точка кончика
+	local desired
+	if c.walking then
+		if not L.wasWalking then
+			L.wasWalking = true
+			L.foot = L.tip
+			L.stepping = false
+		end
+		if active then
+			if L.stepping then
+				L.stepT += dt / c.stepDur
+				if L.stepT >= 1 then
+					L.stepping = false
+					L.foot = L.stepE
+				else
+					local a = smooth(L.stepT)
+					L.foot = L.stepS:Lerp(L.stepE, a) + c.up * (math.sin(math.pi * L.stepT) * c.stepH)
+				end
+			else
+				local id = idealFoot(L, c, ZERO)
+				local dist = (id - L.foot).Magnitude
+				if dist > c.thr then
+					local blocked = false
+					for _, nb in ipairs(NEIGH[i]) do
+						if legs[nb].stepping then
+							blocked = true
+							break
+						end
+					end
+					if (not blocked) or dist > c.thr * 1.7 then
+						L.stepping = true
+						L.stepT = 0
+						L.stepS = L.foot
+						L.stepE = idealFoot(L, c, c.lead)
+					end
+				end
+			end
+		end
+		desired = L.foot + c.up * 0.25
+	else
+		L.wasWalking = false
+		L.stepping = false
+		local lx = MOUNTS[i].X > 0 and 1 or -1
+		local upper = MOUNTS[i].Y > 0
+		local t = c.now
+		local off = Vector3.new(
+			lx * (3.0 + math.sin(t * 1.3 + i * 1.7) * 0.7),
+			(upper and 5 or 3) + math.sin(t * 1.7 + i * 1.3) * 0.8,
+			3.5 + math.cos(t * 1.1 + i * 2.1) * 0.8
+		)
+		desired = torso.CFrame:PointToWorldSpace(MOUNTS[i] + off)
+	end
+
+	local target = mount:Lerp(desired, math.clamp(e, 0, 1))
+
+	-- упругая пружина кончика
+	local k = c.walking and 260 or 80
+	local damp = c.walking and 24 or 8.5
+	L.tipVel += ((target - L.tip) * k - L.tipVel * damp) * dt
+	L.tip += L.tipVel * dt
+
+	-- FABRIK
+	local segLen = SEG_LEN * math.max(e, 0.03)
+	local total = segLen * SEGS
+	local bendDir = safeUnit(c.up + safeUnit(proj(mount - c.rootPos, c.up), ZERO) * 0.6)
+	local prev = {}
+	for q = 1, n do
+		prev[q] = pts[q]
+	end
+	local solved = {}
+	for q = 1, n do
+		solved[q] = pts[q]
+	end
+	for q = 2, n - 1 do
+		solved[q] = solved[q] + bendDir * (math.sin((q - 1) / SEGS * math.pi) * 0.5)
+	end
+	local tp = L.tip
+	local toT = tp - mount
+	if toT.Magnitude >= total then
+		local d = toT.Unit
+		for q = 1, n do
+			solved[q] = mount + d * segLen * (q - 1)
+		end
+	else
+		for _ = 1, 4 do
+			solved[n] = tp
+			for q = n - 1, 1, -1 do
+				solved[q] = solved[q + 1] + safeUnit(solved[q] - solved[q + 1]) * segLen
+			end
+			solved[1] = mount
+			for q = 2, n do
+				solved[q] = solved[q - 1] + safeUnit(solved[q] - solved[q - 1]) * segLen
+			end
+		end
+	end
+	-- упругость суставов
+	local a = 1 - math.exp(-dt * (c.walking and 26 or 16))
+	pts[1] = mount
+	for q = 2, n do
+		local sm = prev[q]:Lerp(solved[q], a)
+		pts[q] = pts[q - 1] + safeUnit(sm - pts[q - 1]) * segLen
+	end
+
+	-- отрисовка
+	local s = math.clamp(e, 0.05, 1.08)
+	for q = 1, SEGS do
+		local p1, p2 = pts[q], pts[q + 1]
+		local len = (p2 - p1).Magnitude
+		local th = (0.55 - 0.32 * (q - 1) / (SEGS - 1)) * s
+		local seg = L.segs[q]
+		seg.Size = Vector3.new(math.max(len, 0.02) * 1.05, th, th)
+		local mid = (p1 + p2) * 0.5
+		local cf
+		if len > 1e-3 then
+			cf = CFrame.lookAt(mid, p2) * CFrame.Angles(0, math.pi / 2, 0)
+		else
+			cf = CFrame.new(mid)
+		end
+		add(seg, cf)
+	end
+	for q = 1, n do
+		local th = (0.55 - 0.32 * (math.min(q, SEGS) - 1) / (SEGS - 1)) * s * 1.35
+		local j = L.joints[q]
+		j.Size = Vector3.new(th, th, th)
+		add(j, CFrame.new(pts[q]))
+	end
+	local dir = safeUnit(pts[n] - pts[n - 1], Vector3.new(0, -1, 0))
+	local base = CFrame.lookAt(pts[n], pts[n] + dir)
+	L.open += ((L.stepping and 0.6 or 0.22) - L.open) * math.min(1, dt * 12)
+	for q = 1, 2 do
+		local sg = q == 1 and 1 or -1
+		local pr = L.prongs[q]
+		pr.Size = Vector3.new(0.14 * s, 0.14 * s, 0.9 * s)
+		add(pr, base * CFrame.Angles(0, sg * L.open, 0) * CFrame.new(0, 0, -0.45 * s))
+	end
+end
+
+----------------------------------------------------------------
+-- ПОЛЗАНИЕ ПО СТЕНАМ
+----------------------------------------------------------------
+local wn = Y
+local wallPos = ZERO
+local look = Vector3.new(0, 0, -1)
+local hoverCur = 3
+local rSign, fSign = 1, 1
+local wallPhase = 0
+local controls
+
+pcall(function()
+	local pm = player:WaitForChild("PlayerScripts", 5):WaitForChild("PlayerModule", 5)
+	controls = require(pm):GetControls()
+end)
+
+local function getMove()
+	if controls then
+		local ok, v = pcall(function()
+			return controls:GetMoveVector()
+		end)
+		if ok and v then
+			return v
+		end
+	end
+	if hum and Workspace.CurrentCamera then
+		local v = Workspace.CurrentCamera.CFrame:VectorToObjectSpace(hum.MoveDirection)
+		return Vector3.new(v.X, 0, v.Z)
+	end
+	return ZERO
+end
+
+local function wallEnter()
+	if not valid() then
+		return
+	end
+	wn = Y
+	wallPos = root.Position
+	hoverCur = 3
+	local l = proj(root.CFrame.LookVector, Y)
+	look = safeUnit(l, Vector3.new(0, 0, -1))
+	hum.PlatformStand = true
+	hum.AutoRotate = false
+end
+
+local function wallExit()
+	if not (hum and hum.Parent and root and root.Parent) then
+		return
+	end
+	hum.PlatformStand = false
+	hum.AutoRotate = true
+	local l = proj(look, Y)
+	if l.Magnitude < 0.1 then
+		l = Vector3.new(0, 0, -1)
+	end
+	local p = root.Position + Y * 2
+	root.CFrame = CFrame.lookAt(p, p + l)
+	root.AssemblyLinearVelocity = ZERO
+	root.AssemblyAngularVelocity = ZERO
+	pcall(function()
+		hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+	end)
+	wn = Y
+end
+
+local function wallStep(dt)
+	local cam = Workspace.CurrentCamera
+	if not cam then
+		return wn
+	end
+	local camCF = cam.CFrame
+	local mv = getMove()
+	local n = wn
+	hoverCur += (HOVER - hoverCur) * (1 - math.exp(-5 * dt))
+	hum.PlatformStand = true
+
+	local tN, tP, udir
+	local amount = 0
+	if mv.Magnitude > 0.1 then
+		local fp = proj(camCF.LookVector, n)
+		local rpj = proj(camCF.RightVector, n)
+		local f, r
+		if fp.Magnitude >= rpj.Magnitude then
+			f = safeUnit(fp)
+			r = f:Cross(n)
+			local dd = r:Dot(camCF.RightVector)
+			if math.abs(dd) > 0.25 then
+				rSign = dd > 0 and 1 or -1
+			end
+			r = r * rSign
+		else
+			r = safeUnit(rpj)
+			f = n:Cross(r)
+			local dd = f:Dot(camCF.LookVector + camCF.UpVector * 0.5)
+			if math.abs(dd) > 0.25 then
+				fSign = dd > 0 and 1 or -1
+			end
+			f = f * fSign
+		end
+		local dir = f * (-mv.Z) + r * mv.X
+		amount = math.min(1, dir.Magnitude)
+		if amount > 0.05 then
+			udir = dir.Unit
+			local speed = 10 + S.speed * 7
+			local dist = speed * dt * amount
+			local sp = wallPos - n * hoverCur
+			local h1 = cast(sp + n * 1.2, udir * (dist + 3.2))
+			if h1 and h1.Normal:Dot(n) < 0.92 then
+				tN = h1.Normal
+				tP = h1.Position + tN * hoverCur
+			else
+				local np = wallPos + udir * dist
+				local h2 = cast(np, -n * (hoverCur + 3))
+				if h2 then
+					tN = h2.Normal
+					tP = h2.Position + tN * hoverCur
+				else
+					-- огибаем выпуклый угол (край крыши, угол здания)
+					local h3 = cast(np - n * (hoverCur + 2), -udir * (hoverCur + 6))
+					if h3 then
+						tN = h3.Normal
+						tP = h3.Position + tN * hoverCur
+					end
+				end
+			end
+		end
+	end
+	if not tP then
+		local h = cast(wallPos, -n * (hoverCur + 3))
+		if h then
+			tN = h.Normal
+			tP = h.Position + tN * hoverCur
+		else
+			tN, tP = n, wallPos
+		end
+	end
+
+	-- плавный поворот нормали
+	local nn = n:Lerp(tN, 1 - math.exp(-10 * dt))
+	if nn.Magnitude < 0.05 then
+		nn = tN
+	end
+	wn = nn.Unit
+	wallPos = wallPos:Lerp(tP, 1 - math.exp(-10 * dt))
+
+	if udir then
+		look = look:Lerp(proj(udir, wn), 1 - math.exp(-10 * dt))
+	end
+	look = proj(look, wn)
+	if look.Magnitude < 0.05 then
+		look = proj(root.CFrame.LookVector, wn)
+		if look.Magnitude < 0.05 then
+			look = proj(Vector3.new(1, 0, 0), wn)
+		end
+	end
+	look = safeUnit(look)
+
+	local bob, roll = 0, 0
+	if amount > 0.05 then
+		wallPhase += dt * (6 + S.speed * 0.9)
+		bob = math.sin(wallPhase * 2) * 0.18 * amount
+		roll = math.sin(wallPhase) * 0.05 * amount
+	end
+	local back = -look
+	local rightV = safeUnit(wn:Cross(back), Vector3.new(1, 0, 0))
+	back = rightV:Cross(wn)
+	root.CFrame = CFrame.fromMatrix(wallPos + wn * bob, rightV, wn, back) * CFrame.Angles(0, 0, roll)
+	root.AssemblyLinearVelocity = ZERO
+	root.AssemblyAngularVelocity = ZERO
+	return wn
+end
+
+connect(RunService.Stepped, function()
+	if S.wall and char then
+		for _, p in ipairs(char:GetDescendants()) do
+			if p:IsA("BasePart") then
+				p.CanCollide = false
+			end
+		end
+	end
+end)
+
+----------------------------------------------------------------
+-- ГЛАВНЫЙ ЦИКЛ
+----------------------------------------------------------------
+local function frame(dt)
+	if not valid() then
+		for _, L in ipairs(legs) do
+			setVis(L, false)
+		end
+		setPlateVis(false)
+		return
+	end
+	dt = math.min(dt, 1 / 15)
+	local now = os.clock()
+	local want = S.tent and (S.walk or S.wall)
+
+	if want ~= lastWant then
+		lastWant = want
+		setAnim(not want)
+		if not want then
+			hum.WalkSpeed = origSpeed
+		end
+	end
+	if want then
+		hum.WalkSpeed = 10 + S.speed * 7
+	end
+
+	-- подъём тела на лапах (на земле)
+	local wantAdd = (want and not S.wall) and HIPADD or 0
+	curAdd += (wantAdd - curAdd) * (1 - math.exp(-4 * dt))
+	if math.abs(curAdd) < 0.01 and wantAdd == 0 then
+		if hipDirty then
+			hum.HipHeight = origHip
+			curAdd = 0
+			hipDirty = false
+		end
+	else
+		hum.HipHeight = origHip + curAdd
+		hipDirty = true
+	end
+
+	local up = Y
+	if S.wall then
+		up = wallStep(dt)
+	end
+
+	local rootPos = root.Position
+	local fwd = proj(root.CFrame.LookVector, up)
+	if fwd.Magnitude < 0.05 then
+		fwd = proj(root.CFrame.UpVector, up)
+	end
+	fwd = safeUnit(fwd, Vector3.new(0, 0, -1))
+	local right = fwd:Cross(up)
+
+	local raw = (rootPos - lastPos) / dt
+	lastPos = rootPos
+	vel = vel:Lerp(proj(raw, up), math.min(1, dt * 10))
+	local lead = vel * 0.3
+	if lead.Magnitude > 5 then
+		lead = lead.Unit * 5
+	end
+
+	local c = {
+		dt = dt,
+		now = now,
+		up = up,
+		fwd = fwd,
+		right = right,
+		rootPos = rootPos,
+		vel = vel,
+		lead = lead,
+		walking = want,
+		stepDur = math.clamp(0.34 - S.speed * 0.02, 0.14, 0.32),
+		thr = 1.9 + S.speed * 0.25,
+		stepH = 1.6,
+	}
+
+	rn = 0
+	local maxExt = 0
+	for _, L in ipairs(legs) do
+		updateLeg(L, c)
+		if L.ext > maxExt then
+			maxExt = L.ext
+		end
+	end
+	setPlateVis(maxExt > 0.02)
+	if plateVis then
+		local s = math.clamp(maxExt * 2, 0, 1)
+		plate.Size = Vector3.new(1.9 * s, 1.9 * s, 0.4)
+		core.Size = Vector3.new(0.6 * s, 0.6 * s, 0.12)
+		add(plate, torso.CFrame * CFrame.new(0, 0.1, 0.55))
+		add(core, torso.CFrame * CFrame.new(0, 0.1, 0.78))
+	end
+	for k = rn + 1, #RP do
+		RP[k] = nil
+		RC[k] = nil
+	end
+	if rn > 0 then
+		Workspace:BulkMoveTo(RP, RC, Enum.BulkMoveMode.FireCFrameChanged)
+	end
+end
+
+----------------------------------------------------------------
+-- ПРИВЯЗКА К ПЕРСОНАЖУ
+----------------------------------------------------------------
+local function bindChar(c)
+	char = c
+	hum = c:WaitForChild("Humanoid", 10)
+	root = c:WaitForChild("HumanoidRootPart", 10)
+	torso = c:FindFirstChild("UpperTorso") or c:FindFirstChild("Torso") or c:WaitForChild("Torso", 5)
+	animate = c:FindFirstChild("Animate")
+	if not (hum and root and torso) then
+		return
+	end
+	origHip = hum.HipHeight
+	origSpeed = hum.WalkSpeed
+	curAdd, hipDirty, lastWant = 0, false, false
+	lastPos = root.Position
+	vel = ZERO
+	rp.FilterDescendantsInstances = { c, folder }
+	for _, L in ipairs(legs) do
+		L.init, L.ext, L.lastGoal, L.stepping, L.wasWalking = false, 0, nil, false, false
+	end
+	if S.wall then
+		task.wait(0.3)
+		wallEnter()
+	end
+end
+
+----------------------------------------------------------------
+-- МЕНЮ
+----------------------------------------------------------------
+local BG = Color3.fromRGB(17, 17, 23)
+local BAR = Color3.fromRGB(24, 24, 32)
+local ACC = Color3.fromRGB(255, 122, 31)
+local TXT = Color3.fromRGB(236, 236, 242)
+local MUT = Color3.fromRGB(125, 125, 142)
+local OFFC = Color3.fromRGB(46, 46, 58)
+
+local gui = new("ScreenGui", {
+	Name = "OctoArms",
+	ResetOnSpawn = false,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	DisplayOrder = 999,
+})
+do
+	local ok = false
+	if gethui then
+		ok = pcall(function()
+			gui.Parent = gethui()
+		end)
+	end
+	if not ok or not gui.Parent then
+		ok = pcall(function()
+			gui.Parent = game:GetService("CoreGui")
+		end)
+	end
+	if not ok or not gui.Parent then
+		gui.Parent = player:WaitForChild("PlayerGui")
+	end
+end
+
+local W, HEAD, CONTENT = 178, 28, 152
+local main = new("Frame", {
+	Size = UDim2.fromOffset(W, HEAD + CONTENT),
+	Position = UDim2.new(0, 24, 0.35, 0),
+	BackgroundColor3 = BG,
+	BorderSizePixel = 0,
+	ClipsDescendants = true,
+	Active = true,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(0, 9) }, main)
+new("UIStroke", { Color = ACC, Thickness = 1, Transparency = 0.55 }, main)
+
+local bar = new("Frame", {
+	Size = UDim2.new(1, 0, 0, HEAD),
+	BackgroundColor3 = BAR,
+	BorderSizePixel = 0,
+}, main)
+new("Frame", {
+	Size = UDim2.new(1, 0, 0, 1),
+	Position = UDim2.new(0, 0, 1, -1),
+	BackgroundColor3 = ACC,
+	BackgroundTransparency = 0.6,
+	BorderSizePixel = 0,
+}, bar)
+
+local drag = new("Frame", { Size = UDim2.new(1, -50, 1, 0), BackgroundTransparency = 1 }, bar)
+new("Frame", {
+	Size = UDim2.fromOffset(7, 7),
+	Position = UDim2.new(0, 10, 0.5, -3),
+	BackgroundColor3 = ACC,
+	BorderSizePixel = 0,
+}, drag)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, drag:GetChildren()[1])
+new("TextLabel", {
+	Size = UDim2.new(1, -26, 1, 0),
+	Position = UDim2.new(0, 24, 0, 0),
+	BackgroundTransparency = 1,
+	Text = "OCTO ARMS",
+	Font = Enum.Font.GothamBold,
+	TextSize = 12,
+	TextColor3 = TXT,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}, drag)
+
+local function headBtn(txt, xoff)
+	return new("TextButton", {
+		Size = UDim2.fromOffset(20, 20),
+		Position = UDim2.new(1, xoff, 0, 4),
+		BackgroundColor3 = OFFC,
+		Text = txt,
+		Font = Enum.Font.GothamBold,
+		TextSize = 14,
+		TextColor3 = TXT,
+		AutoButtonColor = true,
+		BorderSizePixel = 0,
+	}, bar)
+end
+local btnCollapse = headBtn("–", -46)
+local btnClose = headBtn("×", -24)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, btnCollapse)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, btnClose)
+
+local content = new("Frame", {
+	Size = UDim2.fromOffset(W, CONTENT),
+	Position = UDim2.fromOffset(0, HEAD),
+	BackgroundTransparency = 1,
+}, main)
+new("UIPadding", {
+	PaddingTop = UDim.new(0, 9),
+	PaddingLeft = UDim.new(0, 10),
+	PaddingRight = UDim.new(0, 10),
+}, content)
+new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, content)
+
+local refreshers = {}
+local function refreshAll()
+	for _, f in ipairs(refreshers) do
+		f()
+	end
+end
+
+local function rowFrame(order, text)
+	local row = new("Frame", { Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1, LayoutOrder = order }, content)
+	new("TextLabel", {
+		Size = UDim2.new(1, -72, 1, 0),
+		BackgroundTransparency = 1,
+		Text = text,
+		Font = Enum.Font.GothamMedium,
+		TextSize = 12,
+		TextColor3 = TXT,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, row)
+	return row
+end
+
+local function addToggle(order, text, get, onChange)
+	local row = rowFrame(order, text)
+	local sw = new("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, 0, 0.5, 0),
+		Size = UDim2.fromOffset(32, 16),
+		BackgroundColor3 = OFFC,
+		BorderSizePixel = 0,
+	}, row)
+	new("UICorner", { CornerRadius = UDim.new(1, 0) }, sw)
+	local knob = new("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 2, 0.5, 0),
+		Size = UDim2.fromOffset(12, 12),
+		BackgroundColor3 = TXT,
+		BorderSizePixel = 0,
+	}, sw)
+	new("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
+	local hit = new("TextButton", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "" }, row)
+	local ti = TweenInfo.new(0.18, Enum.EasingStyle.Quad)
+	table.insert(refreshers, function()
+		local on = get()
+		TweenService:Create(sw, ti, { BackgroundColor3 = on and ACC or OFFC }):Play()
+		TweenService:Create(knob, ti, { Position = on and UDim2.new(1, -14, 0.5, 0) or UDim2.new(0, 2, 0.5, 0) }):Play()
+	end)
+	hit.MouseButton1Click:Connect(function()
+		onChange(not get())
+	end)
+end
+
+local function addStepper(order, text, get, min, max, onChange)
+	local row = rowFrame(order, text)
+	local function btn(txt, x)
+		local b = new("TextButton", {
+			AnchorPoint = Vector2.new(1, 0.5),
+			Position = UDim2.new(1, x, 0.5, 0),
+			Size = UDim2.fromOffset(18, 18),
+			BackgroundColor3 = OFFC,
+			Text = txt,
+			Font = Enum.Font.GothamBold,
+			TextSize = 13,
+			TextColor3 = TXT,
+			BorderSizePixel = 0,
+		}, row)
+		new("UICorner", { CornerRadius = UDim.new(0, 5) }, b)
+		return b
+	end
+	local plus, minus = btn("+", 0), btn("–", -44)
+	local val = new("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -20, 0.5, 0),
+		Size = UDim2.fromOffset(24, 18),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		TextSize = 12,
+		TextColor3 = ACC,
+		Text = "",
+	}, row)
+	table.insert(refreshers, function()
+		val.Text = tostring(get())
+	end)
+	plus.MouseButton1Click:Connect(function()
+		onChange(math.min(max, get() + 1))
+	end)
+	minus.MouseButton1Click:Connect(function()
+		onChange(math.max(min, get() - 1))
+	end)
+end
+
+local function setWall(v)
+	local was = S.wall
+	S.wall = v
+	if v then
+		S.tent = true
+		if not was then
+			wallEnter()
+		end
+	elseif was then
+		wallExit()
+	end
+	refreshAll()
+end
+local function setTent(v)
+	S.tent = v
+	if not v then
+		S.walk = false
+		if S.wall then
+			setWall(false)
+		end
+	end
+	refreshAll()
+end
+local function setWalk(v)
+	S.walk = v
+	if v then
+		S.tent = true
+	end
+	refreshAll()
+end
+
+addToggle(1, "Щупальца", function() return S.tent end, setTent)
+addToggle(2, "Ходьба на лапах", function() return S.walk end, setWalk)
+addToggle(3, "Ползание по стенам", function() return S.wall end, setWall)
+addStepper(4, "Скорость", function() return S.speed end, 1, 10, function(v) S.speed = v; refreshAll() end)
+addStepper(5, "Кол-во лап", function() return S.count end, 1, 4, function(v) S.count = v; refreshAll() end)
+new("TextLabel", {
+	LayoutOrder = 6,
+	Size = UDim2.new(1, 0, 0, 14),
+	BackgroundTransparency = 1,
+	Text = "RightShift — скрыть меню",
+	Font = Enum.Font.Gotham,
+	TextSize = 10,
+	TextColor3 = MUT,
+}, content)
+refreshAll()
+
+-- сворачивание
+local collapsed = false
+btnCollapse.MouseButton1Click:Connect(function()
+	collapsed = not collapsed
+	btnCollapse.Text = collapsed and "+" or "–"
+	TweenService:Create(main, TweenInfo.new(0.28, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
+		Size = collapsed and UDim2.fromOffset(122, HEAD) or UDim2.fromOffset(W, HEAD + CONTENT),
+	}):Play()
+end)
+
+-- перетаскивание
+do
+	local dragging, dragStart, startPos
+	drag.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragStart, startPos = true, i.Position, main.Position
+			i.Changed:Connect(function()
+				if i.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
+	connect(UIS.InputChanged, function(i)
+		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			local d = i.Position - dragStart
+			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end)
+end
+
+connect(UIS.InputBegan, function(i, gp)
+	if not gp and i.KeyCode == Enum.KeyCode.RightShift then
+		main.Visible = not main.Visible
+	end
+end)
+
+----------------------------------------------------------------
+-- ЗАПУСК / ОЧИСТКА
+----------------------------------------------------------------
+local function destroy()
+	pcall(function()
+		RunService:UnbindFromRenderStep("OctoArms")
+	end)
+	for _, c in ipairs(conns) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	if S.wall then
+		pcall(wallExit)
+	end
+	pcall(function()
+		setAnim(true)
+		if hum then
+			hum.WalkSpeed = origSpeed
+			hum.HipHeight = origHip
+		end
+	end)
+	S.tent, S.walk, S.wall = false, false, false
+	pcall(function()
+		folder:Destroy()
+	end)
+	pcall(function()
+		gui:Destroy()
+	end)
+	ENV.__OCTO = nil
+end
+ENV.__OCTO = { destroy = destroy }
+
+btnClose.MouseButton1Click:Connect(destroy)
+
+RunService:BindToRenderStep("OctoArms", Enum.RenderPriority.Camera.Value + 1, frame)
+
+connect(player.CharacterAdded, function(c)
+	task.spawn(bindChar, c)
+end)
+if player.Character then
+	task.spawn(bindChar, player.Character)
+end
