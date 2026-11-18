@@ -1,0 +1,1032 @@
+--[[
+    ╔══════════════════════════════════════════════════════════╗
+    ║  OCTO ARMS  —  механические щупальца (Doc Ock style)     ║
+    ║  Скрипт для Delta / Roblox (LocalScript, client-side)    ║
+    ╚══════════════════════════════════════════════════════════╝
+
+    • 4 технологических щупальца выходят из спины (из «рюкзака» на позвоночнике)
+    • ты не идёшь сам — тебя несут щупальца: тело поднимается над землёй,
+      лапы делают шаги (диагональная походка), всё упругое / эластичное
+    • можно ускоряться (слайдер), менять количество щупалец (1–4)
+    • выключил — щупальца втягиваются обратно в спину
+    • ПОЛЗАНИЕ: идёшь в стену — и ползёшь по стенам, потолкам и крышам
+      (прыжок = рывок/отлёт от поверхности)
+    • меню маленькое, перетаскивается, сворачивается кнопкой «–»
+]]
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local Workspace        = game:GetService("Workspace")
+
+local LP = Players.LocalPlayer
+if not LP then return end
+
+-- ── убираем прошлый запуск (если скрипт выполнили второй раз) ──────────────
+local genv = _G
+pcall(function() if getgenv then genv = getgenv() end end)
+if genv.__OCTOARMS_CLEANUP then pcall(genv.__OCTOARMS_CLEANUP) end
+
+-- ══════════════════════════ НАСТРОЙКИ ═════════════════════════════════════
+local CFG = {
+    enabled = false,   -- щупальца включены
+    crawl   = false,   -- ползание по стенам
+    count   = 4,       -- сколько щупалец активно (1..4)
+    speed   = 1,       -- множитель скорости
+}
+
+local SEGMENTS = 9        -- звеньев в щупальце
+local LENGTH   = 12.5     -- длина щупальца (студы)
+local LIFT     = 3.6      -- на сколько щупальца поднимают тело
+local FOOT_OFF = 0.65     -- высота «лапы» над поверхностью
+local THICK_A  = 0.66     -- толщина у основания
+local THICK_B  = 0.34     -- толщина у кончика
+
+local SPEED_MIN, SPEED_MAX = 0.5, 6
+
+local ACCENT = Color3.fromRGB(0, 224, 255)
+local STEEL  = Color3.fromRGB(92, 98, 112)
+local STEEL2 = Color3.fromRGB(150, 156, 172)
+local DARK   = Color3.fromRGB(30, 33, 42)
+local WHITE  = Color3.new(1, 1, 1)
+
+-- Слоты щупалец. Координаты относительно тела: x — вправо, z — НАЗАД (спина).
+-- group — диагональные пары шагают по очереди (как у краба/паука)
+local SLOTS = {
+    { anchor = Vector3.new( 0.5,  0.95, 0.62), home = Vector3.new( 4.6, 0, -2.6), group = 1 }, -- перед-право
+    { anchor = Vector3.new(-0.5,  0.95, 0.62), home = Vector3.new(-4.6, 0, -2.6), group = 2 }, -- перед-лево
+    { anchor = Vector3.new(-0.5, -0.25, 0.62), home = Vector3.new(-4.6, 0,  3.4), group = 1 }, -- зад-лево
+    { anchor = Vector3.new( 0.5, -0.25, 0.62), home = Vector3.new( 4.6, 0,  3.4), group = 2 }, -- зад-право
+}
+
+-- ══════════════════════════ УТИЛИТЫ ═══════════════════════════════════════
+local connections = {}
+local function track(c) table.insert(connections, c); return c end
+
+-- пружина (работает и для чисел, и для Vector3) — отсюда вся «эластичность»
+local function spring(pos, vel, target, k, d, dt)
+    local n = math.max(1, math.ceil(dt * 120))
+    local h = dt / n
+    for _ = 1, n do
+        vel = vel + ((target - pos) * k - vel * d) * h
+        pos = pos + vel * h
+    end
+    return pos, vel
+end
+
+local function bez(p0, p1, p2, p3, t)
+    local u = 1 - t
+    return p0 * (u * u * u) + p1 * (3 * u * u * t) + p2 * (3 * u * t * t) + p3 * (t * t * t)
+end
+
+-- CFrame цилиндра: ось X смотрит вдоль dir
+local function cylCF(pos, dir)
+    local ref = Vector3.new(0, 1, 0)
+    if math.abs(dir.Y) > 0.97 then ref = Vector3.new(1, 0, 0) end
+    local z = dir:Cross(ref).Unit
+    local y = z:Cross(dir)
+    return CFrame.fromMatrix(pos, dir, y)
+end
+
+local function perp(n)
+    local a = math.abs(n.Y) < 0.9 and Vector3.new(0, 1, 0) or Vector3.new(1, 0, 0)
+    return n:Cross(a).Unit
+end
+
+local function newPart(shape, color, material, parent)
+    local p = Instance.new("Part")
+    p.Anchored = true
+    p.CanCollide = false
+    p.CanTouch = false
+    p.CanQuery = false
+    p.Massless = true
+    p.Shape = shape
+    p.Material = material
+    p.Color = color
+    p.Size = Vector3.new(1, 1, 1)
+    p.TopSurface = Enum.SurfaceType.Smooth
+    p.BottomSurface = Enum.SurfaceType.Smooth
+    p.Parent = parent
+    return p
+end
+
+local function sz(v) return math.max(v, 0.02) end
+
+-- ══════════════════════════ ЛУЧИ / ЗЕМЛЯ ══════════════════════════════════
+local container = Instance.new("Folder")
+container.Name = "OA_" .. tostring(math.random(10000, 99999))
+container.Parent = Workspace
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+pcall(function() rayParams.RespectCanCollide = true end)
+
+local function ray(origin, dir)
+    return Workspace:Raycast(origin, dir, rayParams)
+end
+
+-- ══════════════════════════ ЩУПАЛЬЦА (визуал) ═════════════════════════════
+local tentacles = {}
+
+local function setShown(t, b)
+    if t.shown ~= b then
+        t.shown = b
+        t.folder.Parent = b and container or nil
+        if not b then t.init = false end
+    end
+end
+
+local function resetTentacle(t)
+    t.ext, t.extV = 0, 0
+    t.want = false
+    t.raise = false
+    t.planted = nil
+    t.stepping = false
+    t.tip, t.tipV = Vector3.zero, Vector3.zero
+    t.hs, t.hsV = 0, 0
+    t.need = 0
+    t.active = false
+    t.init = false
+    setShown(t, false)
+end
+
+for i, slot in ipairs(SLOTS) do
+    local t = { slot = slot, idx = i, segs = {}, rings = {}, joints = {}, prongs = {} }
+    t.folder = Instance.new("Folder")
+    t.folder.Name = "T" .. i
+    for s = 1, SEGMENTS do
+        t.segs[s]  = newPart(Enum.PartType.Cylinder, STEEL, Enum.Material.Metal, t.folder)
+        t.rings[s] = newPart(Enum.PartType.Cylinder, ACCENT, Enum.Material.Neon, t.folder)
+    end
+    for j = 0, SEGMENTS do
+        t.joints[j] = newPart(Enum.PartType.Ball, DARK, Enum.Material.Metal, t.folder)
+    end
+    t.palm = newPart(Enum.PartType.Ball, ACCENT, Enum.Material.Neon, t.folder)
+    for k = 1, 3 do
+        t.prongs[k] = newPart(Enum.PartType.Cylinder, STEEL2, Enum.Material.Metal, t.folder)
+    end
+    tentacles[i] = t
+    resetTentacle(t)
+end
+
+-- «рюкзак» на спине, из которого растут щупальца
+local harness     = newPart(Enum.PartType.Block, DARK, Enum.Material.Metal, nil)
+local harnessGlow = newPart(Enum.PartType.Block, ACCENT, Enum.Material.Neon, nil)
+local harnessShown = false
+
+local function updateHarness(c, ext)
+    local show = ext > 0.02
+    if show ~= harnessShown then
+        harnessShown = show
+        harness.Parent = show and container or nil
+        harnessGlow.Parent = show and container or nil
+    end
+    if not show then return end
+    local s = math.clamp(ext, 0, 1)
+    local base = c.torso.CFrame * CFrame.new(0, 0.3, 0.62)
+    harness.Size = Vector3.new(sz(1.7 * s), sz(2.1 * s), sz(0.34 * s))
+    harness.CFrame = base
+    harnessGlow.Size = Vector3.new(sz(0.14 * s), sz(1.7 * s), sz(0.06 * s))
+    harnessGlow.CFrame = base * CFrame.new(0, 0, 0.18 * s)
+end
+
+-- рисуем одно щупальце по Безье + немного «живого» колебания
+local function drawTentacle(t, base, tip, up, right, now, spd, dt)
+    local ext = math.max(t.ext, 0)
+    local chord = tip - base
+    local d = chord.Magnitude
+    local cdir = d > 1e-3 and chord / d or -up
+
+    local out = right * (t.slot.home.X > 0 and 1 or -1)
+    local p0 = out * 0.9 + up * 0.8
+    p0 = p0 - cdir * p0:Dot(cdir)
+    if p0.Magnitude < 1e-3 then p0 = up - cdir * up:Dot(cdir) end
+    if p0.Magnitude < 1e-3 then p0 = out end
+    local pole = p0.Unit
+
+    -- высота дуги: чтобы длина кривой ≈ LENGTH (звенья не растягиваются зря)
+    local slack = math.max(LENGTH * LENGTH - d * d, 0)
+    local hT = math.clamp(0.66 * math.sqrt(slack), 0.7, LENGTH * 0.62)
+    t.hs, t.hsV = spring(t.hs, t.hsV, hT + (t.stepping and 0.7 or 0), 90, 7, dt)
+    local h = math.max(t.hs, 0.3)
+
+    local c1 = base + pole * h + cdir * (d * 0.12)
+    local c2 = tip + up * (h * 0.7 + 0.8) + pole * (h * 0.2)
+
+    local side = cdir:Cross(pole)
+    local amp = 0.07 + math.min(spd, 40) * 0.005
+    local P = {}
+    for i = 0, SEGMENTS do
+        local s = i / SEGMENTS
+        local p = bez(base, c1, c2, tip, s)
+        local w = math.sin(math.pi * s)
+        p = p + side * (math.sin(now * 3.2 + s * 6 + t.idx * 1.9) * amp * w)
+              + pole * (math.sin(now * 2.3 + s * 5 + t.idx) * amp * 0.7 * w)
+        P[i] = base + (p - base) * ext
+    end
+
+    local scale = math.clamp(ext, 0, 1.12)
+    for i = 1, SEGMENTS do
+        local a, b = P[i - 1], P[i]
+        local dv = b - a
+        local len = dv.Magnitude
+        local thick = (THICK_A + (THICK_B - THICK_A) * ((i - 1) / (SEGMENTS - 1))) * scale
+        if len > 1e-3 then
+            local cf = cylCF((a + b) * 0.5, dv / len)
+            local seg, ring = t.segs[i], t.rings[i]
+            seg.Size = Vector3.new(sz(len * 1.04), sz(thick * 0.84), sz(thick * 0.84))
+            seg.CFrame = cf
+            ring.Size = Vector3.new(sz(len * 0.2), sz(thick * 1.06), sz(thick * 1.06))
+            ring.CFrame = cf
+            local pulse = 0.5 + 0.5 * math.sin(now * 4 - i * 0.55 + t.idx)
+            ring.Color = ACCENT:Lerp(WHITE, pulse * 0.35)
+        end
+        local js = sz(thick * (i == 1 and 1.7 or 1.12))
+        local j = t.joints[i - 1]
+        j.Size = Vector3.new(js, js, js)
+        j.Position = a
+    end
+
+    -- кончик + «лапа» из трёх когтей
+    local tipP = P[SEGMENTS]
+    local lastJ = t.joints[SEGMENTS]
+    local ls = sz(THICK_B * scale * 1.2)
+    lastJ.Size = Vector3.new(ls, ls, ls)
+    lastJ.Position = tipP
+
+    local dir = tipP - P[SEGMENTS - 1]
+    if dir.Magnitude < 1e-3 then dir = -up else dir = dir.Unit end
+    local u = perp(dir)
+    local w2 = dir:Cross(u)
+    local tilt = 0.62
+    for k = 1, 3 do
+        local a = (k - 1) * (2 * math.pi / 3) + 0.5
+        local pd = (dir * math.cos(tilt) + (u * math.cos(a) + w2 * math.sin(a)) * math.sin(tilt)).Unit
+        local plen = 1.05 * scale
+        local prong = t.prongs[k]
+        prong.Size = Vector3.new(sz(plen), sz(0.2 * scale), sz(0.2 * scale))
+        prong.CFrame = cylCF(tipP + pd * (plen * 0.5), pd)
+    end
+    local ps = sz(0.5 * scale)
+    t.palm.Size = Vector3.new(ps, ps, ps)
+    t.palm.Position = tipP + dir * (0.18 * scale)
+end
+
+-- ══════════════════════════ КОНТЕКСТ ПЕРСОНАЖА ════════════════════════════
+local ctx = nil
+local controls = nil
+
+task.spawn(function()
+    pcall(function()
+        local pm = require(LP:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule"))
+        controls = pm:GetControls()
+    end)
+end)
+
+local function findMotor(char, names)
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("Motor6D") then
+            for _, n in ipairs(names) do
+                if d.Name == n then return d end
+            end
+        end
+    end
+    return nil
+end
+
+local MOTOR_DEFS = {
+    { names = { "RightShoulder", "Right Shoulder" }, kind = "arm", side =  1 },
+    { names = { "LeftShoulder",  "Left Shoulder"  }, kind = "arm", side = -1 },
+    { names = { "RightHip",      "Right Hip"      }, kind = "leg", side =  1 },
+    { names = { "LeftHip",       "Left Hip"       }, kind = "leg", side = -1 },
+}
+
+local function bind(char)
+    local hum  = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not root then return false end
+    local torso = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso") or root
+    ctx = {
+        char = char, hum = hum, root = root, torso = torso,
+        r15 = hum.RigType == Enum.HumanoidRigType.R15,
+        origHip = hum.HipHeight, baseSpeed = hum.WalkSpeed,
+        animate = char:FindFirstChild("Animate"),
+        on = false, crawling = false,
+        lift = 0, liftV = 0, anyPlanted = false,
+        lastPos = root.Position, vel = Vector3.zero,
+        pose = 0, poseV = 0, posed = false, phase = 0,
+        hipDirty = false, motors = {},
+        n = Vector3.new(0, 1, 0), face = Vector3.new(0, 0, -1),
+        cpos = root.Position, cvel = Vector3.zero, air = false,
+        noStick = 0, wishLast = Vector3.zero,
+    }
+    for _, def in ipairs(MOTOR_DEFS) do
+        local m = findMotor(char, def.names)
+        if m then
+            table.insert(ctx.motors, { m = m, c0 = m.C0, kind = def.kind, side = def.side })
+        end
+    end
+    rayParams.FilterDescendantsInstances = { char, container }
+    for _, t in ipairs(tentacles) do resetTentacle(t) end
+    return true
+end
+
+local function standH(c)
+    return c.origHip + (c.r15 and 0 or 2) + c.root.Size.Y * 0.5
+end
+
+-- поза ползания: руки тянутся вперёд-вверх, ноги волочатся (анимация через C0)
+local function applyPose(c, alpha, phase)
+    for _, e in ipairs(c.motors) do
+        local sw = math.sin(phase + (e.side == 1 and 0 or math.pi)) * 0.35 * alpha
+        local R
+        if e.kind == "arm" then
+            R = CFrame.Angles(0, 0, e.side * 0.45 * alpha) * CFrame.Angles(2.3 * alpha + sw, 0, 0)
+        else
+            R = CFrame.Angles(0, 0, e.side * 0.22 * alpha) * CFrame.Angles(-0.35 * alpha - sw * 0.8, 0, 0)
+        end
+        local p = e.c0.Position
+        local rot = CFrame.new(-p) * e.c0
+        e.m.C0 = CFrame.new(p) * R * rot
+    end
+end
+
+-- ══════════════════════════ ПОЛЗАНИЕ ПО СТЕНАМ ════════════════════════════
+local function getMoveVector()
+    if controls then
+        local ok, v = pcall(function() return controls:GetMoveVector() end)
+        if ok and typeof(v) == "Vector3" then return v end
+    end
+    local c, cam = ctx, Workspace.CurrentCamera
+    if c and cam then
+        local look = cam.CFrame.LookVector
+        local flat = Vector3.new(look.X, 0, look.Z)
+        if flat.Magnitude > 0.01 then
+            local f = CFrame.new(Vector3.new(0, 0, 0), flat.Unit)
+            return f:VectorToObjectSpace(c.hum.MoveDirection)
+        end
+    end
+    return Vector3.zero
+end
+
+-- ищем поверхность: стена впереди / выпуклый угол / то, на чём стоим
+local function pickSurface(origin, n, wd, hover)
+    local reach = hover + 2.6
+    if wd then
+        local r = ray(origin, wd * (hover + 0.9))
+        if r and r.Normal:Dot(n) < 0.85 then
+            return r.Position + r.Normal * hover, r.Normal
+        end
+    end
+    local r = ray(origin, -n * reach)
+    if r then
+        if wd then
+            local ahead = ray(origin + wd * 2.4, -n * reach)
+            if not ahead then
+                local c = ray(origin + wd * 2.4 - n * (hover + 1.2), -wd * 4.2)
+                if c then return c.Position + c.Normal * hover, c.Normal end
+            end
+        end
+        return r.Position + r.Normal * hover, r.Normal
+    end
+    if wd then
+        local a = ray(origin + wd * 2.4, -n * reach)
+        if a then return a.Position + a.Normal * hover, a.Normal end
+    end
+    local g = ray(origin, Vector3.new(0, -1, 0) * reach)
+    if g then return g.Position + g.Normal * hover, g.Normal end
+    return nil
+end
+
+local function enterCrawl(c)
+    local up = c.root.CFrame.UpVector
+    if up.Y < 0.5 then up = Vector3.new(0, 1, 0) end
+    c.n = up.Unit
+    c.cpos = c.root.Position
+    c.face = c.root.CFrame.LookVector
+    c.cvel = Vector3.zero
+    c.air = false
+    c.noStick = 0
+    c.hum.PlatformStand = true
+end
+
+local function exitCrawl(c)
+    c.hum.PlatformStand = false
+    local pos = c.root.Position
+    local flat = Vector3.new(c.face.X, 0, c.face.Z)
+    if flat.Magnitude < 0.05 then flat = Vector3.new(0, 0, -1) end
+    c.root.CFrame = CFrame.new(pos, pos + flat.Unit)
+    c.root.AssemblyLinearVelocity = Vector3.zero
+    c.root.AssemblyAngularVelocity = Vector3.zero
+    c.n = Vector3.new(0, 1, 0)
+    pcall(function() c.hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+end
+
+local function crawlStep(c, dt, now, lift)
+    local hum, root = c.hum, c.root
+    local cam = Workspace.CurrentCamera
+    local n = c.n
+
+    -- направление движения в плоскости поверхности (относительно камеры)
+    local mv = getMoveVector()
+    local wish = Vector3.zero
+    if cam and mv.Magnitude > 0.08 then
+        local cf = cam.CFrame
+        local f1 = cf.LookVector - n * cf.LookVector:Dot(n)
+        local f2 = cf.UpVector - n * cf.UpVector:Dot(n)
+        local f = f1 + f2 * (1 - math.min(f1.Magnitude, 1))
+        if f.Magnitude > 1e-3 then
+            local r = cf.RightVector - n * cf.RightVector:Dot(n)
+            if r.Magnitude < 1e-3 then r = f:Cross(n) end
+            wish = f.Unit * (-mv.Z) + r.Unit * mv.X
+            if wish.Magnitude > 1 then wish = wish.Unit end
+        end
+    end
+    c.wishLast = wish
+
+    local spd = hum.WalkSpeed
+    local hover = standH(c) + lift
+    local wd = wish.Magnitude > 0.1 and wish.Unit or nil
+
+    local newPos
+    local air = c.air
+    if air then
+        c.cvel = c.cvel + Vector3.new(0, -Workspace.Gravity, 0) * dt
+        newPos = c.cpos + c.cvel * dt + wish * spd * 0.3 * dt
+    else
+        newPos = c.cpos + wish * spd * dt
+    end
+
+    local tPos, tN
+    if now >= c.noStick then
+        tPos, tN = pickSurface(newPos, n, wd, hover)
+    end
+    if tPos then
+        if air then air = false; c.cvel = Vector3.zero end
+        newPos = newPos + (tPos - newPos) * (1 - math.exp(-dt * 16))
+        local nn = n:Lerp(tN, 1 - math.exp(-dt * 11))
+        if nn.Magnitude > 0.05 then n = nn.Unit else n = tN end
+    else
+        air = true
+        local nn = n:Lerp(Vector3.new(0, 1, 0), 1 - math.exp(-dt * 3))
+        if nn.Magnitude > 0.05 then n = nn.Unit end
+    end
+
+    -- куда смотрит тело (по движению)
+    local face = c.face - n * c.face:Dot(n)
+    if face.Magnitude < 0.05 then face = perp(n) end
+    face = face.Unit
+    if wd then
+        local nf = face:Lerp(wd, 1 - math.exp(-dt * 9))
+        if nf.Magnitude > 0.05 then face = nf.Unit end
+    end
+    face = face - n * face:Dot(n)
+    if face.Magnitude < 0.05 then face = perp(n) end
+    face = face.Unit
+
+    c.face, c.n, c.cpos, c.air = face, n, newPos, air
+    root.CFrame = CFrame.fromMatrix(newPos, face:Cross(n), n)
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+end
+
+track(UserInputService.JumpRequest:Connect(function()
+    local c = ctx
+    if c and c.crawling and not c.air then
+        c.air = true
+        c.cvel = c.n * 52 + Vector3.new(0, 14, 0) + c.wishLast * c.hum.WalkSpeed * 0.5
+        c.noStick = os.clock() + 0.22
+    end
+end))
+
+-- ══════════════════════════ ГЛАВНЫЙ ЦИКЛ ══════════════════════════════════
+local function hideAll()
+    for _, t in ipairs(tentacles) do
+        if t.shown then resetTentacle(t) end
+    end
+    updateHarness({ torso = harness }, 0)
+end
+
+local function startStep(t, dur)
+    t.stepping = true
+    t.stepT = 0
+    t.stepFrom = t.planted
+    t.dur = dur
+    t.arcH = math.clamp(1.4 + t.need * 0.5, 1.4, 3.2)
+end
+
+local function update(dt)
+    dt = math.clamp(dt, 1 / 240, 1 / 20)
+    local char = LP.Character
+    if not char or not char.Parent then hideAll(); ctx = nil; return end
+    if not ctx or ctx.char ~= char then
+        if not bind(char) then return end
+    end
+    local c = ctx
+    local hum, root = c.hum, c.root
+    if not hum.Parent or not root.Parent then return end
+
+    local now = os.clock()
+    local on = CFG.enabled and hum.Health > 0
+    c.animate = c.animate or char:FindFirstChild("Animate")
+
+    -- включение / выключение
+    if on ~= c.on then
+        c.on = on
+        if on then
+            c.baseSpeed = hum.WalkSpeed
+            if c.animate then c.animate.Disabled = true end
+            for _, tr in ipairs(hum:GetPlayingAnimationTracks()) do tr:Stop(0.1) end
+        else
+            if c.animate then c.animate.Disabled = false end
+            hum.WalkSpeed = c.baseSpeed
+        end
+    end
+
+    -- скорость тела
+    local pos = root.Position
+    local rv = (pos - c.lastPos) / dt
+    c.lastPos = pos
+    if rv.Magnitude > 220 then rv = Vector3.zero end
+    c.vel = c.vel:Lerp(rv, 1 - math.exp(-dt * 10))
+    local bodySpeed = c.vel.Magnitude
+
+    local crawl = on and CFG.crawl
+    if crawl ~= c.crawling then
+        c.crawling = crawl
+        if crawl then enterCrawl(c) else exitCrawl(c) end
+    end
+
+    -- подъём тела над землёй (эластичная пружина)
+    local liftTarget = (on and c.anyPlanted) and LIFT or 0
+    c.lift, c.liftV = spring(c.lift, c.liftV, liftTarget, 55, 9, dt)
+    local lift = math.max(c.lift, 0)
+
+    if on then
+        local sp = c.baseSpeed * CFG.speed
+        if hum.WalkSpeed ~= sp then hum.WalkSpeed = sp end
+    end
+
+    c.phase = c.phase + dt * (2 + bodySpeed * 0.3)
+    local bob = math.sin(c.phase * 2) * 0.12 * math.min(1, bodySpeed / 12)
+
+    if on or lift > 0.02 then
+        hum.HipHeight = c.origHip + lift + bob
+        c.hipDirty = true
+    elseif c.hipDirty then
+        hum.HipHeight = c.origHip
+        c.hipDirty = false
+    end
+
+    if crawl then crawlStep(c, dt, now, lift + bob) end
+
+    -- поза ползания
+    c.pose, c.poseV = spring(c.pose, c.poseV, crawl and 1 or 0, 45, 9, dt)
+    local pa = math.clamp(c.pose, 0, 1)
+    if pa > 0.01 then
+        applyPose(c, pa, c.phase * 1.6)
+        c.posed = true
+    elseif c.posed then
+        applyPose(c, 0, 0)
+        c.posed = false
+    end
+
+    -- ── система координат тела ──
+    local up = crawl and c.n or Vector3.new(0, 1, 0)
+    local rcf = root.CFrame
+    local right = rcf.RightVector
+    right = right - up * right:Dot(up)
+    if right.Magnitude < 0.1 then right = perp(up) end
+    right = right.Unit
+    local fwd = up:Cross(right)
+    local hover = standH(c) + lift
+
+    local mult = CFG.speed
+    local stepDur = math.clamp(0.2 / math.sqrt(mult), 0.07, 0.28)
+    local thr = math.min(2.2 + 0.7 * (mult - 1), 4.2)
+    local v = c.vel - up * c.vel:Dot(up)
+    local lead = v * (stepDur * 1.2)
+    if lead.Magnitude > 5.5 then lead = lead.Unit * 5.5 end
+
+    -- ── проход 1: состояния, земля, прогресс шага ──
+    local busy = { false, false }
+    local anyPlanted = false
+    local maxExt = 0
+
+    for _, t in ipairs(tentacles) do
+        local slot = t.slot
+        t.need = 0
+        local want = on and t.idx <= CFG.count
+        if want ~= t.want then
+            t.want = want
+            t.raise = true
+            t.stepping = false
+            if want then
+                t.startAt = now + (t.idx - 1) * 0.11
+                t.raiseEnd = t.startAt + 0.55
+            else
+                t.raiseEnd = math.huge
+                t.foldAt = now + 0.22 + (t.idx - 1) * 0.05
+            end
+        end
+
+        local extTarget = 0
+        if want then
+            if now >= t.startAt then extTarget = 1 end
+            if t.raise and now >= t.raiseEnd then
+                t.raise = false
+                t.planted = nil -- «удар» лапой в землю
+            end
+        elseif now < (t.foldAt or 0) and t.ext > 0.05 then
+            extTarget = 1
+        end
+        t.ext, t.extV = spring(t.ext, t.extV, extTarget, 60, 7, dt) -- упругое выдвижение / втягивание
+        maxExt = math.max(maxExt, t.ext)
+
+        local visible = t.ext > 0.015 or extTarget > 0
+        setShown(t, visible)
+        t.active = visible
+
+        if visible then
+            local anchorW = c.torso.CFrame:PointToWorldSpace(slot.anchor)
+            t.anchorW = anchorW
+            local off = right * slot.home.X + fwd * (-slot.home.Z)
+            local approx = rcf.Position + off
+            local hit = ray(approx + up * 2.5, -up * 30)
+            local ground
+            if hit then
+                ground = hit.Position + hit.Normal * FOOT_OFF
+            else
+                ground = approx - up * hover + up * FOOT_OFF
+            end
+            t.ground = ground
+
+            if not t.init then
+                t.init = true
+                t.tip, t.tipV = anchorW, Vector3.zero
+            end
+
+            if t.raise then
+                local sgn = slot.home.X > 0 and 1 or -1
+                t.target = anchorW + up * (LENGTH * 0.62) + right * (sgn * 2.2)
+                    + fwd * (-slot.home.Z * 0.25)
+                    + right * (math.sin(now * 4 + t.idx * 1.7) * 0.6)
+                t.k, t.d = 110, 8
+            else
+                if not t.planted then t.planted = ground end
+                t.k, t.d = 190, 12
+                local leadPos = ground + lead
+                local dv = leadPos - t.planted
+                dv = dv - up * dv:Dot(up) * 0.4
+                t.need = dv.Magnitude / thr
+                t.over = (anchorW - t.planted).Magnitude > LENGTH * 0.95
+
+                if t.stepping then
+                    t.stepT = t.stepT + dt / t.dur
+                    local kk = math.min(t.stepT, 1)
+                    local e = kk * kk * (3 - 2 * kk)
+                    t.target = t.stepFrom:Lerp(leadPos, e) + up * (math.sin(math.pi * kk) * t.arcH)
+                    if t.stepT >= 1 then
+                        t.stepping = false
+                        t.planted = leadPos
+                        t.target = leadPos
+                    else
+                        busy[slot.group] = true
+                    end
+                else
+                    t.target = t.planted
+                end
+                if t.ext > 0.6 then anyPlanted = true end
+            end
+        end
+    end
+    c.anyPlanted = anyPlanted
+
+    -- ── решаем, какая диагональная пара шагает (походка «трот») ──
+    if not busy[1] and not busy[2] then
+        local best, bestNeed = nil, 1
+        for g = 1, 2 do
+            local need = 0
+            for _, t in ipairs(tentacles) do
+                if t.active and not t.raise and t.slot.group == g and t.need > need then need = t.need end
+            end
+            if need > bestNeed then best, bestNeed = g, need end
+        end
+        if best then
+            for _, t in ipairs(tentacles) do
+                if t.active and not t.raise and t.slot.group == best and not t.stepping and t.need > 0.45 then
+                    startStep(t, stepDur)
+                end
+            end
+        end
+    end
+    for _, t in ipairs(tentacles) do
+        if t.active and not t.raise and not t.stepping and (t.need > 1.9 or t.over) then
+            startStep(t, stepDur)
+        end
+    end
+
+    -- ── проход 2: пружина кончика + отрисовка ──
+    for _, t in ipairs(tentacles) do
+        if t.active then
+            t.tip, t.tipV = spring(t.tip, t.tipV, t.target, t.k, t.d, dt)
+            if not t.raise and t.planted and not t.stepping then
+                local h = (t.tip - t.planted):Dot(up)
+                if h < 0 then
+                    t.tip = t.tip - up * h
+                    local vn = t.tipV:Dot(up)
+                    if vn < 0 then
+                        t.tipV = t.tipV - up * vn * (1 + (vn < -4 and 0.3 or 0))
+                    end
+                end
+            end
+            drawTentacle(t, t.anchorW, t.tip, up, right, now, bodySpeed, dt)
+        end
+    end
+    updateHarness(c, maxExt)
+end
+
+local lastErr = nil
+RunService:BindToRenderStep("OctoArms", Enum.RenderPriority.Camera.Value - 1, function(dt)
+    local ok, err = pcall(update, dt)
+    if not ok and err ~= lastErr then
+        lastErr = err
+        warn("[OctoArms] " .. tostring(err))
+    end
+end)
+
+-- ══════════════════════════ МЕНЮ ══════════════════════════════════════════
+local BG     = Color3.fromRGB(13, 14, 21)
+local ROW    = Color3.fromRGB(23, 25, 36)
+local OFF    = Color3.fromRGB(52, 56, 74)
+local TXT    = Color3.fromRGB(226, 231, 242)
+local MUTED  = Color3.fromRGB(132, 140, 158)
+local VIOLET = Color3.fromRGB(140, 92, 255)
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "OctoArmsUI"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999
+local parented = pcall(function()
+    gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+end)
+if not parented or not gui.Parent then
+    gui.Parent = LP:WaitForChild("PlayerGui")
+end
+
+local function make(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    o.Parent = parent
+    return o
+end
+local function corner(o, r) return make("UICorner", { CornerRadius = UDim.new(0, r) }, o) end
+
+local W, HEADER, FULL_H = 172, 30, 178
+local CW = 132
+
+local root = make("Frame", {
+    Name = "Root", Size = UDim2.fromOffset(W, FULL_H), Position = UDim2.fromOffset(12, 70),
+    BackgroundColor3 = BG, BackgroundTransparency = 0.04, BorderSizePixel = 0, ClipsDescendants = true,
+}, gui)
+corner(root, 10)
+local stroke = make("UIStroke", { Color = ACCENT, Thickness = 1, Transparency = 0.45 }, root)
+make("UIGradient", {
+    Color = ColorSequence.new(ACCENT, VIOLET), Rotation = 45,
+}, stroke)
+
+local header = make("Frame", {
+    Name = "Header", Size = UDim2.new(1, 0, 0, HEADER), BackgroundTransparency = 1,
+}, root)
+local dot = make("Frame", {
+    Size = UDim2.fromOffset(8, 8), Position = UDim2.fromOffset(11, 11), BackgroundColor3 = OFF, BorderSizePixel = 0,
+}, header)
+corner(dot, 4)
+make("TextLabel", {
+    Text = "OCTO ARMS", Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = TXT,
+    TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(26, 0), Size = UDim2.new(1, -80, 1, 0),
+}, header)
+
+local function hbtn(text, xOff)
+    local b = make("TextButton", {
+        Text = text, Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = MUTED, AutoButtonColor = false,
+        BackgroundColor3 = ROW, Size = UDim2.fromOffset(20, 20), AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, xOff, 0.5, 0), BorderSizePixel = 0,
+    }, header)
+    corner(b, 6)
+    return b
+end
+local closeBtn = hbtn("×", -7)
+local foldBtn  = hbtn("–", -31)
+
+local body = make("Frame", {
+    Name = "Body", Position = UDim2.fromOffset(0, HEADER), Size = UDim2.new(1, 0, 1, -HEADER),
+    BackgroundTransparency = 1,
+}, root)
+make("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, 2) }, body)
+make("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, body)
+
+local function row(h, order)
+    local r = make("Frame", {
+        Size = UDim2.new(1, 0, 0, h), BackgroundColor3 = ROW, BorderSizePixel = 0, LayoutOrder = order,
+    }, body)
+    corner(r, 7)
+    return r
+end
+
+local function label(parent, text, size)
+    return make("TextLabel", {
+        Text = text, Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = TXT,
+        TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(10, 0), Size = size or UDim2.new(1, -56, 0, 26),
+    }, parent)
+end
+
+local function makeToggle(text, order, cb)
+    local r = row(26, order)
+    label(r, text)
+    local track_ = make("Frame", {
+        Size = UDim2.fromOffset(32, 16), AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0),
+        BackgroundColor3 = OFF, BorderSizePixel = 0,
+    }, r)
+    corner(track_, 8)
+    local knob = make("Frame", {
+        Size = UDim2.fromOffset(12, 12), AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 2, 0.5, 0),
+        BackgroundColor3 = WHITE, BorderSizePixel = 0,
+    }, track_)
+    corner(knob, 6)
+    local click = make("TextButton", { Text = "", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1) }, r)
+    local state = false
+    local obj = {}
+    function obj.set(v, silent)
+        state = v
+        TweenService:Create(track_, TweenInfo.new(0.18, Enum.EasingStyle.Quad), {
+            BackgroundColor3 = v and ACCENT or OFF,
+        }):Play()
+        TweenService:Create(knob, TweenInfo.new(0.2, Enum.EasingStyle.Back), {
+            Position = v and UDim2.new(0, 18, 0.5, 0) or UDim2.new(0, 2, 0.5, 0),
+        }):Play()
+        if not silent then cb(v) end
+    end
+    track(click.Activated:Connect(function() obj.set(not state) end))
+    return obj
+end
+
+local tentToggle, crawlToggle
+
+local function setEnabled(v)
+    CFG.enabled = v
+    TweenService:Create(dot, TweenInfo.new(0.2), { BackgroundColor3 = v and ACCENT or OFF }):Play()
+    if not v and CFG.crawl then
+        CFG.crawl = false
+        crawlToggle.set(false, true)
+    end
+end
+tentToggle = makeToggle("Щупальца", 1, setEnabled)
+crawlToggle = makeToggle("Ползание", 2, function(v)
+    CFG.crawl = v
+    if v and not CFG.enabled then
+        tentToggle.set(true) -- ползание работает на щупальцах — включаем их
+    end
+end)
+
+-- количество щупалец
+do
+    local r = row(26, 3)
+    label(r, "Кол-во")
+    local function sbtn(text, x)
+        local b = make("TextButton", {
+            Text = text, Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = TXT, AutoButtonColor = false,
+            BackgroundColor3 = Color3.fromRGB(38, 42, 58), Size = UDim2.fromOffset(22, 20),
+            AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, x, 0.5, 0), BorderSizePixel = 0,
+        }, r)
+        corner(b, 6)
+        return b
+    end
+    local plus, minus = sbtn("+", -6), sbtn("–", -52)
+    local num = make("TextLabel", {
+        Text = tostring(CFG.count), Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = ACCENT,
+        BackgroundTransparency = 1, Size = UDim2.fromOffset(20, 20), AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -30, 0.5, 0),
+    }, r)
+    local function setCount(n)
+        CFG.count = math.clamp(n, 1, 4)
+        num.Text = tostring(CFG.count)
+    end
+    track(plus.Activated:Connect(function() setCount(CFG.count + 1) end))
+    track(minus.Activated:Connect(function() setCount(CFG.count - 1) end))
+end
+
+-- скорость
+local speedRow = row(40, 4)
+label(speedRow, "Скорость", UDim2.new(1, -60, 0, 24))
+local speedVal = make("TextLabel", {
+    Text = "x1.0", Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = ACCENT, BackgroundTransparency = 1,
+    TextXAlignment = Enum.TextXAlignment.Right, Position = UDim2.new(1, -50, 0, 0), Size = UDim2.fromOffset(42, 24),
+}, speedRow)
+local sTrack = make("Frame", {
+    Position = UDim2.new(0, 10, 0, 29), Size = UDim2.new(1, -20, 0, 5), BackgroundColor3 = OFF, BorderSizePixel = 0,
+}, speedRow)
+corner(sTrack, 3)
+local sFill = make("Frame", { Size = UDim2.fromScale(0, 1), BackgroundColor3 = ACCENT, BorderSizePixel = 0 }, sTrack)
+corner(sFill, 3)
+make("UIGradient", { Color = ColorSequence.new(ACCENT, VIOLET) }, sFill)
+local sKnob = make("Frame", {
+    Size = UDim2.fromOffset(12, 12), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0, 0.5),
+    BackgroundColor3 = WHITE, BorderSizePixel = 0, ZIndex = 3,
+}, sTrack)
+corner(sKnob, 6)
+local sHit = make("TextButton", {
+    Text = "", BackgroundTransparency = 1, Position = UDim2.new(0, 4, 0, 18), Size = UDim2.new(1, -8, 0, 22),
+}, speedRow)
+
+local function setSpeed(v)
+    v = math.clamp(v, SPEED_MIN, SPEED_MAX)
+    CFG.speed = v
+    local a = (v - SPEED_MIN) / (SPEED_MAX - SPEED_MIN)
+    sFill.Size = UDim2.fromScale(a, 1)
+    sKnob.Position = UDim2.fromScale(a, 0.5)
+    speedVal.Text = string.format("x%.1f", v)
+end
+setSpeed(CFG.speed)
+
+local sliding, slideInput = false, nil
+local function slideFromX(x)
+    local a = math.clamp((x - sTrack.AbsolutePosition.X) / math.max(sTrack.AbsoluteSize.X, 1), 0, 1)
+    setSpeed(math.floor((SPEED_MIN + a * (SPEED_MAX - SPEED_MIN)) * 10 + 0.5) / 10)
+end
+track(sHit.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        sliding, slideInput = true, i
+        slideFromX(i.Position.X)
+    end
+end))
+
+-- перетаскивание меню за шапку
+local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
+track(header.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+        dragging, dragInput, dragStart, startPos = true, i, i.Position, root.Position
+    end
+end))
+track(UserInputService.InputChanged:Connect(function(i)
+    if sliding and (i == slideInput or i.UserInputType == Enum.UserInputType.MouseMovement) then
+        slideFromX(i.Position.X)
+    end
+    if dragging and (i == dragInput or i.UserInputType == Enum.UserInputType.MouseMovement) then
+        local d = i.Position - dragStart
+        root.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end))
+track(UserInputService.InputEnded:Connect(function(i)
+    if i == slideInput or i.UserInputType == Enum.UserInputType.MouseButton1 then sliding = false end
+    if i == dragInput or i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+end))
+
+-- сворачивание меню (плавно «заворачивается» в маленькую плашку)
+local expanded = true
+local foldToken = 0
+track(foldBtn.Activated:Connect(function()
+    expanded = not expanded
+    foldToken = foldToken + 1
+    local token = foldToken
+    if expanded then body.Visible = true end
+    TweenService:Create(root, TweenInfo.new(0.32, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
+        Size = expanded and UDim2.fromOffset(W, FULL_H) or UDim2.fromOffset(CW, HEADER),
+    }):Play()
+    foldBtn.Text = expanded and "–" or "+"
+    if not expanded then
+        task.delay(0.3, function()
+            if foldToken == token then body.Visible = false end
+        end)
+    end
+end))
+
+-- ══════════════════════════ ЗАВЕРШЕНИЕ ════════════════════════════════════
+local function cleanup()
+    for _, cn in ipairs(connections) do pcall(function() cn:Disconnect() end) end
+    pcall(function() RunService:UnbindFromRenderStep("OctoArms") end)
+    pcall(function()
+        local c = ctx
+        if c then
+            if c.crawling then c.hum.PlatformStand = false end
+            c.hum.HipHeight = c.origHip
+            if c.on then c.hum.WalkSpeed = c.baseSpeed end
+            if c.animate then c.animate.Disabled = false end
+            for _, e in ipairs(c.motors) do e.m.C0 = e.c0 end
+        end
+    end)
+    pcall(function() harness:Destroy() end)
+    pcall(function() harnessGlow:Destroy() end)
+    pcall(function() container:Destroy() end)
+    pcall(function() gui:Destroy() end)
+    genv.__OCTOARMS_CLEANUP = nil
+end
+genv.__OCTOARMS_CLEANUP = cleanup
+
+track(closeBtn.Activated:Connect(cleanup))
