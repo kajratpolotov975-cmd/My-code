@@ -1,0 +1,604 @@
+-- OCTO ARMS / Spring Edition 2.0
+-- DELTA BUILD: self-contained client script. No ModuleScript, no RemoteEvent, no Studio install.
+-- Paste into Delta -> Execute. Unload: getgenv().OCTO_ARMS_UNLOAD()
+-- Keys: Q - щупальца, F - удар, E - захват, R - бросок, Shift - бег, [ ] - длина.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+
+local player = Players.LocalPlayer
+
+local Config = {
+    Enabled = true,
+    Length = 12,
+    Count = 4,
+    Speed = 1,
+    Spring = 65,
+    Combat = true,
+    Grab = true,
+    Sound = true,
+    Volume = 0.55,
+    Footsteps = true,
+    Damage = 35,
+    ThrowDamage = 45,
+    ThrowForce = 85,
+    Sounds = {
+        Electronic = "rbxasset://sounds/electronicpingshort.wav",
+        Impact = "rbxasset://sounds/impact_generic.mp3",
+    },
+}
+
+local state = {
+    enabled = Config.Enabled, length = Config.Length, count = Config.Count,
+    speed = Config.Speed, combat = Config.Combat, grab = Config.Grab,
+    sprinting = false, held = nil, cooldowns = {},
+}
+local soundEnabled = Config.Sound
+local actors, connections = {}, {}
+local visuals = Instance.new("Folder")
+visuals.Name = "OctoArmsSpringVisuals"
+visuals.Parent = workspace
+local BLUE = Color3.fromRGB(12, 143, 255)
+local CYAN = Color3.fromRGB(81, 222, 255)
+local DARK = Color3.fromRGB(25, 36, 49)
+local SEGMENTS, COILS = 112, 16
+
+local function techSound(kind, root)
+    if not soundEnabled or not root then return end
+    local sound = Instance.new("Sound")
+    sound.SoundId = (kind == "step" or kind == "attack") and Config.Sounds.Impact or Config.Sounds.Electronic
+    sound.Volume = Config.Volume * (kind == "step" and 0.28 or 0.65)
+    sound.RollOffMaxDistance = 45
+    sound.PlaybackSpeed = ({deploy = 0.55, retract = 1.8, step = 1.35, attack = 0.8, grab = 1.2, throw = 0.7})[kind] or 1
+    sound.Parent = root
+    sound.Looped = kind == "deploy" or kind == "retract"
+    sound:Play()
+    if kind == "deploy" or kind == "retract" then
+        TweenService:Create(sound, TweenInfo.new(0.65), {PlaybackSpeed = kind == "deploy" and 1.9 or 0.45, Volume = 0}):Play()
+    end
+    Debris:AddItem(sound, 2)
+    if kind == "step" then
+        local ping = Instance.new("Sound")
+        ping.SoundId, ping.Volume, ping.PlaybackSpeed = Config.Sounds.Electronic, Config.Volume * 0.06, 2
+        ping.Parent = root
+        ping:Play()
+        Debris:AddItem(ping, 1)
+    end
+end
+
+local function part(parent, name, color, neon)
+    local item = Instance.new("Part")
+    item.Name, item.Anchored, item.CanCollide, item.CanTouch, item.CanQuery = name, true, false, false, false
+    item.CastShadow = false
+    item.Material = neon and Enum.Material.Neon or Enum.Material.SmoothPlastic
+    item.Color, item.Size = color, Vector3.new(0.1, 0.1, 0.1)
+    item.TopSurface, item.BottomSurface = Enum.SurfaceType.Smooth, Enum.SurfaceType.Smooth
+    item.Parent = parent
+    return item
+end
+
+local function cylinderBetween(item, a, b, width)
+    local distance = (b - a).Magnitude
+    item.Shape = Enum.PartType.Cylinder
+    item.Size = Vector3.new(math.max(0.005, distance + 0.025), width, width)
+    item.CFrame = CFrame.lookAt((a + b) / 2, b) * CFrame.Angles(0, math.pi / 2, 0)
+end
+
+local function cubic(a, b, c, d, t)
+    local u = 1 - t
+    return a * u ^ 3 + b * 3 * u ^ 2 * t + c * 3 * u * t ^ 2 + d * t ^ 3
+end
+
+local function createActor(owner, character, root)
+    local model = Instance.new("Model")
+    model.Name = "SpringArms_" .. owner.UserId
+    model.Parent = visuals
+    local actor = {model = model, character = character, root = root, deployment = 0, velocity = 0,
+        arms = {}, lastEnabled = false, lastStep = 0, actionAt = -10}
+    actor.pack = part(model, "Backpack", DARK, false)
+    actor.core = part(model, "EnergyCore", CYAN, true)
+    actor.core.Shape = Enum.PartType.Ball
+    for i = 1, 4 do
+        local arm = {segments = {}, claws = {}}
+        for n = 1, SEGMENTS do
+            arm.segments[n] = part(model, "Spring_" .. i, n % 8 == 0 and CYAN or BLUE, false)
+        end
+        for n = 1, 6 do arm.claws[n] = part(model, "Claw_" .. i, n % 2 == 0 and CYAN or DARK, n % 2 == 0) end
+        actor.arms[i] = arm
+    end
+    actors[owner] = actor
+    return actor
+end
+
+local function removeActor(owner)
+    local actor = actors[owner]
+    if not actor then return end
+    if actor.runningSound and actor.runningSound.Parent then actor.runningSound.Volume = actor.runningVolume end
+    actor.model:Destroy()
+    actors[owner] = nil
+end
+
+local function drawActor(actor, owner, dt, now)
+    local root, character = actor.root, actor.character
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+    local enabled = character:GetAttribute("OctoEnabled") == true
+    if enabled ~= actor.lastEnabled then
+        techSound(enabled and "deploy" or "retract", root)
+        actor.lastEnabled = enabled
+    end
+    actor.velocity = actor.velocity + (((enabled and 1 or 0) - actor.deployment) * (65 + Config.Spring) - actor.velocity * 15) * dt
+    actor.deployment = actor.deployment + actor.velocity * dt
+    local extension = math.max(0, actor.deployment)
+    local length = (character:GetAttribute("OctoLength") or Config.Length) / 12
+    local count = character:GetAttribute("OctoCount") or Config.Count
+    local moving = humanoid.MoveDirection.Magnitude > 0.05
+    local actualSpeed = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z).Magnitude
+    local pace = math.max(0.5, actualSpeed / 16)
+    if owner == player and moving and enabled and Config.Footsteps and now - actor.lastStep > math.max(0.12, 0.5 / pace) then
+        techSound("step", root)
+        actor.lastStep = now
+    end
+    if owner == player then
+        local runningSound = root:FindFirstChild("Running")
+        if runningSound and runningSound:IsA("Sound") then
+            if actor.runningSound ~= runningSound then actor.runningSound, actor.runningVolume = runningSound, runningSound.Volume end
+            runningSound.Volume = enabled and Config.Footsteps and 0 or actor.runningVolume
+        end
+    end
+    local visible = extension > 0.02
+    actor.pack.Transparency, actor.core.Transparency = visible and 0 or 1, visible and 0 or 1
+    actor.pack.Size = Vector3.new(1.35, 1.8, 0.6) * math.max(0.01, extension)
+    actor.pack.CFrame = root.CFrame * CFrame.new(0, 0.35, 0.85)
+    actor.core.Size = Vector3.one * 0.52 * math.max(0.01, extension)
+    actor.core.CFrame = root.CFrame * CFrame.new(0, 0.5, 1.2)
+    local heldValue = character:FindFirstChild("OctoHeldTarget")
+    local held = heldValue and heldValue.Value
+    local target = held or (now - actor.actionAt < 0.62 and actor.actionTarget)
+    local targetRoot = target and (target:FindFirstChild("HumanoidRootPart") or target.PrimaryPart)
+    for i, arm in ipairs(actor.arms) do
+        local armVisible = visible and i <= count
+        for _, segment in ipairs(arm.segments) do segment.Transparency = armVisible and 0 or 1 end
+        for _, claw in ipairs(arm.claws) do claw.Transparency = armVisible and 0 or 1 end
+        if armVisible then
+            local side = i % 2 == 1 and -1 or 1
+            local upper = i <= 2
+            local sway = math.sin(now * (0.9 + Config.Spring / 170) + i * 1.8) * 0.14
+            local step = moving and math.sin(now * 6 * pace + (i % 2) * math.pi) or 0
+            local a = Vector3.new(side * 0.65, upper and 0.8 or 0.1, 0.8)
+            local b = Vector3.new(side * (upper and 2 or 3), (upper and 3.3 or 1) + sway, 1.5)
+            local c = Vector3.new(side * (upper and 5.8 or 4.8), (upper and 4.3 or -0.2) + sway, upper and 0 or -1)
+            local d = Vector3.new(side * (upper and 4.5 or 3.6), upper and 1.7 + sway or -3.3 + math.max(0, step) * 0.6, -1.5 + step * 0.6)
+            b = a + (b * length - a) * extension
+            c = a + (c * length - a) * extension
+            d = a + (d * length - a) * extension
+            if not upper then
+                local worldFoot = root.CFrame:PointToWorldSpace(d)
+                local params = RaycastParams.new()
+                params.FilterType = Enum.RaycastFilterType.Exclude
+                params.FilterDescendantsInstances = {character, visuals}
+                local hit = workspace:Raycast(worldFoot + Vector3.new(0, 4, 0), Vector3.new(0, -10, 0), params)
+                if hit then d = root.CFrame:PointToObjectSpace(hit.Position + Vector3.new(0, 0.2 + math.max(0, step) * 0.6, 0)) end
+            end
+            if i == math.min(2, count) and (targetRoot or now - actor.actionAt < 0.62) then
+                local reach = held and 1 or math.sin(math.clamp((now - actor.actionAt) / 0.62, 0, 1) * math.pi) ^ 0.6
+                local localTarget = targetRoot and root.CFrame:PointToObjectSpace(targetRoot.Position) or Vector3.new(0, 1, -6 * length)
+                d = d:Lerp(localTarget, reach)
+                c = c:Lerp(localTarget + Vector3.new(0, 2, 1), reach * 0.9)
+            end
+            local previous
+            for n = 0, SEGMENTS do
+                local t = n / SEGMENTS
+                local center = cubic(a, b, c, d, t)
+                local tangent = cubic(a, b, c, d, math.min(1, t + 0.003)) - cubic(a, b, c, d, math.max(0, t - 0.003))
+                local normal = tangent.Unit:Cross(Vector3.zAxis)
+                if normal.Magnitude < 0.01 then normal = tangent.Unit:Cross(Vector3.yAxis) end
+                normal = normal.Unit
+                local binormal = tangent.Unit:Cross(normal).Unit
+                local angle = t * math.pi * 2 * COILS
+                local radius = (0.23 - t * 0.06) * extension
+                local point = root.CFrame:PointToWorldSpace(center + normal * math.cos(angle) * radius + binormal * math.sin(angle) * radius)
+                if previous then cylinderBetween(arm.segments[n], previous, point, 0.09 * math.max(0.05, extension)) end
+                previous = point
+            end
+            local endpoint = root.CFrame:PointToWorldSpace(d)
+            local facing = CFrame.lookAt(endpoint, root.CFrame:PointToWorldSpace(c))
+            for finger = 0, 2 do
+                local angle = finger * math.pi * 2 / 3
+                local first = facing:PointToWorldSpace(Vector3.new(math.cos(angle) * 0.17, math.sin(angle) * 0.17, -0.05))
+                local middle = facing:PointToWorldSpace(Vector3.new(math.cos(angle) * 0.28, math.sin(angle) * 0.28, -0.35))
+                local tip = facing:PointToWorldSpace(Vector3.new(math.cos(angle) * 0.09, math.sin(angle) * 0.09, -0.57))
+                cylinderBetween(arm.claws[finger * 2 + 1], first, middle, 0.12)
+                cylinderBetween(arm.claws[finger * 2 + 2], middle, tip, 0.07)
+            end
+        end
+    end
+end
+
+-- ===== Local NPC layer (Delta has no server script: grab / damage simulated client-side) =====
+
+local function npcParts(model)
+    if not model or not model:IsA("Model") or Players:GetPlayerFromCharacter(model) then return end
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+    if humanoid and root and root:IsA("BasePart") and humanoid.Health > 0 then
+        return humanoid, root
+    end
+end
+
+local function nearestNpc()
+    local character = player.Character
+    local origin = character and character:FindFirstChild("HumanoidRootPart")
+    if not origin then return end
+    local best, bestDistance
+    for _, item in ipairs(workspace:GetDescendants()) do
+        if item:IsA("Humanoid") and item.Health > 0 then
+            local model = item.Parent
+            local humanoid, targetRoot = npcParts(model)
+            if humanoid and not model:GetAttribute("OctoHeldBy") and not targetRoot.Anchored then
+                local distance = (targetRoot.Position - origin.Position).Magnitude
+                if distance <= state.length and (not bestDistance or distance < bestDistance) then
+                    local params = RaycastParams.new()
+                    params.FilterType = Enum.RaycastFilterType.Exclude
+                    params.FilterDescendantsInstances = {character, model}
+                    local obstructed = workspace:Raycast(origin.Position, targetRoot.Position - origin.Position, params)
+                    if not obstructed then best, bestDistance = model, distance end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function myRoot()
+    local character = player.Character
+    return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+local function release()
+    local held = state.held
+    if not held then return end
+    state.held = nil
+    if held.death then pcall(function() held.death:Disconnect() end) end
+    pcall(function() held.model:SetAttribute("OctoHeldBy", nil) end)
+    if held.humanoid and held.humanoid.Parent then
+        pcall(function()
+            held.humanoid.PlatformStand = held.platformStand
+            held.humanoid.AutoRotate = held.autoRotate
+        end)
+    end
+    local character = player.Character
+    local value = character and character:FindFirstChild("OctoHeldTarget")
+    if value then value.Value = nil end
+end
+
+local function grabAction()
+    if state.held then
+        release()
+        return
+    end
+    if not state.grab then return end
+    local model = nearestNpc()
+    if not model then return end
+    local humanoid, root = npcParts(model)
+    if not humanoid then return end
+    local ok = pcall(function()
+        state.held = {
+            model = model, humanoid = humanoid, root = root,
+            platformStand = humanoid.PlatformStand, autoRotate = humanoid.AutoRotate,
+            death = humanoid.Died:Connect(function() release() end),
+        }
+        model:SetAttribute("OctoHeldBy", player.UserId)
+        humanoid.PlatformStand = true
+        humanoid.AutoRotate = false
+    end)
+    if not ok then state.held = nil return end
+    local character = player.Character
+    local value = character and character:FindFirstChild("OctoHeldTarget")
+    if value then value.Value = model end
+    techSound("grab", myRoot())
+end
+
+local function throwAction()
+    local held = state.held
+    if not held then return end
+    local origin = myRoot()
+    release()
+    if not origin then return end
+    pcall(function()
+        local direction = (held.root.Position - origin.Position)
+        direction = Vector3.new(direction.X, 0, direction.Z)
+        if direction.Magnitude < 0.1 then direction = origin.CFrame.LookVector * 3 end
+        held.root.AssemblyLinearVelocity = direction.Unit * Config.ThrowForce + Vector3.new(0, 32, 0)
+        held.root.AssemblyAngularVelocity = Vector3.new(2, 1, 3)
+    end)
+    -- landing damage is applied on a timer: the client cannot rely on Touched
+    -- firing for parts it does not simulate.
+    task.delay(1.1, function()
+        if held.humanoid.Parent and held.humanoid.Health > 0 then
+            pcall(function() held.humanoid:TakeDamage(Config.ThrowDamage) end)
+        end
+    end)
+    techSound("throw", origin)
+end
+
+local function attackAction()
+    local actor = actors[player]
+    if actor then actor.actionAt, actor.actionTarget = os.clock(), nil end
+    local model = nearestNpc()
+    if model then
+        local humanoid = model:FindFirstChildOfClass("Humanoid")
+        if humanoid then pcall(function() humanoid:TakeDamage(Config.Damage) end) end
+    end
+    techSound("attack", myRoot())
+end
+
+-- ===== Local dispatch (replaces RemoteEvent:FireServer) =====
+
+local function setMotion()
+    if not state.baseSpeed then return end
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+    humanoid.WalkSpeed = state.baseSpeed * (state.enabled and state.speed or 1) * (state.enabled and state.sprinting and 1.7 or 1)
+    humanoid.HipHeight = state.baseHip + (state.enabled and 1.15 or 0)
+end
+
+local function syncAttributes()
+    local character = player.Character
+    if not character then return end
+    for name, value in pairs({
+        OctoEnabled = state.enabled, OctoLength = state.length, OctoCount = state.count,
+        OctoSpeed = state.speed, OctoCombat = state.combat, OctoGrab = state.grab,
+    }) do character:SetAttribute(name, value) end
+end
+
+local function dispatch(action, value)
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not character or not humanoid or humanoid.Health <= 0 then return end
+    local now = os.clock()
+    local cooldown = (action == "Attack" or action == "Throw") and 0.65 or 0.08
+    if now - (state.cooldowns[action] or -math.huge) < cooldown then return end
+    state.cooldowns[action] = now
+
+    if action == "Enabled" then
+        state.enabled = value == true
+        if not state.enabled then release() end
+    elseif action == "Length" then
+        state.length = math.clamp(math.round(value), 4, 24)
+    elseif action == "Count" then
+        state.count = math.clamp(math.round(value), 1, 4)
+    elseif action == "Speed" then
+        state.speed = math.clamp(value, 0.5, 6)
+    elseif action == "Sprint" then
+        state.sprinting = value == true
+    elseif action == "Combat" then
+        state.combat = value == true
+    elseif action == "GrabEnabled" then
+        state.grab = value == true
+        if not state.grab then release() end
+    elseif action == "Attack" then
+        if not state.combat then return end
+        attackAction()
+    elseif action == "Grab" then
+        if not state.grab then return end
+        grabAction()
+    elseif action == "Throw" then
+        throwAction()
+    end
+    syncAttributes()
+    setMotion()
+end
+
+-- ===== Character setup =====
+
+local function initialize(character)
+    local humanoid = character:WaitForChild("Humanoid", 10)
+    local root = character:WaitForChild("HumanoidRootPart", 10)
+    if not humanoid or not root or player.Character ~= character then return end
+    state.baseSpeed, state.baseHip = humanoid.WalkSpeed, humanoid.HipHeight
+    local value = Instance.new("ObjectValue")
+    value.Name = "OctoHeldTarget"
+    value.Parent = character
+    syncAttributes()
+    setMotion()
+    humanoid.Died:Connect(function() release() end)
+end
+
+player.CharacterAdded:Connect(initialize)
+if player.Character then task.spawn(initialize, player.Character) end
+player.CharacterRemoving:Connect(function() release() end)
+
+-- ===== UI =====
+
+local gui = Instance.new("ScreenGui")
+gui.Name, gui.ResetOnSpawn, gui.IgnoreGuiInset = "OctoArmsUI", false, false
+gui.Parent = player:WaitForChild("PlayerGui")
+local panel = Instance.new("Frame")
+panel.Size, panel.Position = UDim2.fromOffset(244, 350), UDim2.new(0, 16, 0.5, -175)
+panel.BackgroundColor3, panel.BorderSizePixel = Color3.fromRGB(12, 18, 27), 0
+panel.Parent = gui
+local corner = Instance.new("UICorner")
+corner.CornerRadius, corner.Parent = UDim.new(0, 10), panel
+local stroke = Instance.new("UIStroke")
+stroke.Color, stroke.Transparency, stroke.Parent = CYAN, 0.7, panel
+
+local function label(text, parent, position, size)
+    local item = Instance.new("TextLabel")
+    item.Text, item.Font, item.TextSize = text, Enum.Font.GothamMedium, 13
+    item.TextColor3, item.BackgroundTransparency = Color3.fromRGB(205, 219, 232), 1
+    item.Position, item.Size, item.TextXAlignment = position, size, Enum.TextXAlignment.Left
+    item.Parent = parent
+    return item
+end
+
+local function button(text, parent, position, size, callback)
+    local item = Instance.new("TextButton")
+    item.Text, item.Font, item.TextSize = text, Enum.Font.GothamMedium, 13
+    item.TextColor3, item.BackgroundColor3, item.BorderSizePixel = CYAN, Color3.fromRGB(25, 39, 54), 0
+    item.Position, item.Size, item.Parent = position, size, parent
+    local radius = Instance.new("UICorner")
+    radius.CornerRadius, radius.Parent = UDim.new(0, 6), item
+    table.insert(connections, item.Activated:Connect(callback))
+    return item
+end
+
+local function attribute(name, fallback)
+    local character = player.Character
+    if not character then return fallback end
+    local value = character:GetAttribute(name)
+    if value == nil then return fallback end
+    return value
+end
+
+local titleBar = label("OCTO ARMS / SPRING", panel, UDim2.fromOffset(14, 0), UDim2.new(1, -50, 0, 42))
+titleBar.TextColor3, titleBar.Active = CYAN, true
+local dragging, dragStart, panelStart
+table.insert(connections, titleBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging, dragStart, panelStart = true, input.Position, panel.Position
+    end
+end))
+table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        panel.Position = UDim2.new(panelStart.X.Scale, panelStart.X.Offset + delta.X, panelStart.Y.Scale, panelStart.Y.Offset + delta.Y)
+    end
+end))
+table.insert(connections, UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then dragging = false end
+end))
+
+local content = Instance.new("Frame")
+content.BackgroundTransparency, content.Size, content.Position, content.Parent = 1, UDim2.new(1, 0, 1, -44), UDim2.fromOffset(0, 44), panel
+local collapsed = false
+button("-", panel, UDim2.new(1, -34, 0, 9), UDim2.fromOffset(25, 25), function()
+    collapsed = not collapsed
+    content.Visible = not collapsed
+    panel.Size = UDim2.fromOffset(244, collapsed and 44 or 350)
+end)
+
+local enabledButton = button("", content, UDim2.fromOffset(12, 0), UDim2.fromOffset(220, 32), function() dispatch("Enabled", not state.enabled) end)
+local lengthLabel = label("", content, UDim2.fromOffset(14, 40), UDim2.fromOffset(148, 32))
+button("-", content, UDim2.fromOffset(164, 42), UDim2.fromOffset(30, 28), function() dispatch("Length", attribute("OctoLength", Config.Length) - 1) end)
+button("+", content, UDim2.fromOffset(200, 42), UDim2.fromOffset(30, 28), function() dispatch("Length", attribute("OctoLength", Config.Length) + 1) end)
+local countLabel = label("", content, UDim2.fromOffset(14, 79), UDim2.fromOffset(148, 32))
+button("-", content, UDim2.fromOffset(164, 81), UDim2.fromOffset(30, 28), function() dispatch("Count", attribute("OctoCount", Config.Count) - 1) end)
+button("+", content, UDim2.fromOffset(200, 81), UDim2.fromOffset(30, 28), function() dispatch("Count", attribute("OctoCount", Config.Count) + 1) end)
+local speedLabel = label("", content, UDim2.fromOffset(14, 118), UDim2.fromOffset(148, 32))
+button("-", content, UDim2.fromOffset(164, 120), UDim2.fromOffset(30, 28), function() dispatch("Speed", attribute("OctoSpeed", Config.Speed) - 0.5) end)
+button("+", content, UDim2.fromOffset(200, 120), UDim2.fromOffset(30, 28), function() dispatch("Speed", attribute("OctoSpeed", Config.Speed) + 0.5) end)
+local combatButton = button("", content, UDim2.fromOffset(12, 162), UDim2.fromOffset(220, 31), function() dispatch("Combat", not state.combat) end)
+local grabButton = button("", content, UDim2.fromOffset(12, 201), UDim2.fromOffset(220, 31), function() dispatch("GrabEnabled", not state.grab) end)
+local soundButton = button("", content, UDim2.fromOffset(12, 240), UDim2.fromOffset(220, 31), function() soundEnabled = not soundEnabled end)
+label("Q  щупальца   |   Shift  бег", content, UDim2.fromOffset(15, 276), UDim2.fromOffset(220, 23)).TextSize = 10
+
+local actions = Instance.new("Frame")
+actions.BackgroundTransparency, actions.AnchorPoint = 1, Vector2.new(1, 1)
+actions.Position, actions.Size, actions.Parent = UDim2.new(1, -20, 1, -90), UDim2.fromOffset(164, 132), gui
+local attackButton = button("F  /  УДАР", actions, UDim2.fromOffset(0, 0), UDim2.fromOffset(164, 38), function() dispatch("Attack") end)
+local takeButton = button("E  /  ЗАХВАТ", actions, UDim2.fromOffset(0, 46), UDim2.fromOffset(164, 38), function() dispatch("Grab") end)
+local throwButton = button("R  /  БРОСИТЬ", actions, UDim2.fromOffset(0, 92), UDim2.fromOffset(164, 38), function() dispatch("Throw") end)
+
+table.insert(connections, UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == Enum.KeyCode.Q then dispatch("Enabled", not state.enabled)
+    elseif input.KeyCode == Enum.KeyCode.F then dispatch("Attack")
+    elseif input.KeyCode == Enum.KeyCode.E then dispatch("Grab")
+    elseif input.KeyCode == Enum.KeyCode.R then dispatch("Throw")
+    elseif input.KeyCode == Enum.KeyCode.LeftShift then dispatch("Sprint", true)
+    elseif input.KeyCode == Enum.KeyCode.LeftBracket then dispatch("Length", attribute("OctoLength", Config.Length) - 1)
+    elseif input.KeyCode == Enum.KeyCode.RightBracket then dispatch("Length", attribute("OctoLength", Config.Length) + 1) end
+end))
+table.insert(connections, UserInputService.InputEnded:Connect(function(input)
+    if input.KeyCode == Enum.KeyCode.LeftShift then dispatch("Sprint", false) end
+end))
+table.insert(connections, UserInputService.WindowFocusReleased:Connect(function() dispatch("Sprint", false) end))
+
+local accumulator, lastUi = 0, 0
+table.insert(connections, RunService.RenderStepped:Connect(function(dt)
+    accumulator = accumulator + dt
+    if accumulator < 1 / 30 then return end
+    local stepDt = math.min(accumulator, 0.05)
+    accumulator = 0
+    local now = os.clock()
+
+    -- hold the grabbed NPC in front of the player (client-side simulation)
+    local held = state.held
+    if held then
+        if not held.root.Parent or not held.humanoid.Parent or held.humanoid.Health <= 0 then
+            release()
+        else
+            local origin = myRoot()
+            if origin then
+                local target = origin.CFrame * CFrame.new(0, 1.6, -(1 + state.length * 0.3))
+                pcall(function()
+                    held.root.CFrame = target
+                    held.root.AssemblyLinearVelocity = Vector3.zero
+                end)
+            end
+        end
+    end
+
+    for _, owner in ipairs(Players:GetPlayers()) do
+        local character = owner.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        local actor = actors[owner]
+        if actor and (not root or character ~= actor.character) then removeActor(owner); actor = nil end
+        if root and not actor and character:GetAttribute("OctoEnabled") then actor = createActor(owner, character, root) end
+        if actor then
+            drawActor(actor, owner, stepDt, now)
+            if not character:GetAttribute("OctoEnabled") and actor.deployment < 0.015 and math.abs(actor.velocity) < 0.02 then
+                removeActor(owner)
+            end
+        end
+    end
+
+    if now - lastUi > 0.1 then
+        lastUi = now
+        local enabled = attribute("OctoEnabled", Config.Enabled)
+        enabledButton.Text = enabled and "Q  /  УБРАТЬ ЩУПАЛЬЦА" or "Q  /  РАСКРЫТЬ ЩУПАЛЬЦА"
+        lengthLabel.Text = "Длина: " .. attribute("OctoLength", Config.Length)
+        countLabel.Text = "Щупальца: " .. attribute("OctoCount", Config.Count)
+        speedLabel.Text = string.format("Скорость: x%.1f", attribute("OctoSpeed", Config.Speed))
+        combatButton.Text = "Удар: " .. (attribute("OctoCombat", Config.Combat) and "ВКЛ" or "ВЫКЛ")
+        grabButton.Text = "Захват NPC: " .. (attribute("OctoGrab", Config.Grab) and "ВКЛ" or "ВЫКЛ")
+        soundButton.Text = "Техно-звуки: " .. (soundEnabled and "ВКЛ" or "ВЫКЛ")
+        attackButton.Visible = enabled and attribute("OctoCombat", Config.Combat)
+        takeButton.Visible = enabled and attribute("OctoGrab", Config.Grab)
+        local heldValue = player.Character and player.Character:FindFirstChild("OctoHeldTarget")
+        takeButton.Text = heldValue and heldValue.Value and "E  /  ОТПУСТИТЬ" or "E  /  ЗАХВАТ"
+        throwButton.Visible = enabled and heldValue ~= nil and heldValue.Value ~= nil
+    end
+end))
+
+table.insert(connections, Players.PlayerRemoving:Connect(removeActor))
+
+local function unload()
+    for _, connection in ipairs(connections) do pcall(function() connection:Disconnect() end) end
+    connections = {}
+    for owner in pairs(actors) do removeActor(owner) end
+    pcall(function() release() end)
+    pcall(function() visuals:Destroy() end)
+    pcall(function() gui:Destroy() end)
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if humanoid and state.baseSpeed then
+        humanoid.WalkSpeed = state.baseSpeed
+        humanoid.HipHeight = state.baseHip
+    end
+    if getgenv then getgenv().OCTO_ARMS_UNLOAD = nil end
+    print("[OCTO ARMS] выгружено")
+end
+
+if getgenv then
+    if getgenv().OCTO_ARMS_UNLOAD then pcall(getgenv().OCTO_ARMS_UNLOAD) end
+    getgenv().OCTO_ARMS_UNLOAD = unload
+end
+pcall(function() script.Destroying:Connect(unload) end)
+
+print("[OCTO ARMS] Delta build загружен. Q - щупальца, F - удар, E - захват, R - бросок.")
