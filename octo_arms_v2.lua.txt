@@ -1,0 +1,1623 @@
+--[[
+    ╔══════════════════════════════════════════════════════════════════╗
+    ║  OCTO ARMS v2  —  кибер-щупальца как у Рика (Рик и Морти)        ║
+    ║  Скрипт для Delta / Roblox (LocalScript, client-side)            ║
+    ╚══════════════════════════════════════════════════════════════════╝
+
+    ЧТО НОВОГО В v2
+    • ЩУПАЛЬЦА КАК У РИКА: глянцевые чёрные сегменты, серебристая броня,
+      неоново-зелёные кольца с бегущим «зарядом» и трёхпалая клешня на конце.
+      Выходят из зелёного ПОРТАЛА на спине (как портальная пушка Рика).
+    • ЗВУКИ — всё через встроенные sounds Roblox + эффекты (работает без загрузок):
+        – открытие портала: электрический треск, нарастающий «power-up», выдох пара
+        – каждое щупальце выдвигается с трещоткой (серво-щелчки с ростом тона)
+          и «ударом» лапы в землю
+        – втягивание: обратная трещотка + щелчок замка + закрытие портала
+        – ТЯЖЁЛЫЕ ШАГИ: каждый шаг щупальца — глухой удар + металлический лязг + бас
+        – при ползании по стенам/потолку: «цап» когтей, лязг на углах,
+          рывок при прыжке, тяжёлое приземление
+        – ЧЕМ БЫСТРЕЕ ИДЁШЬ — ТЕМ БЫСТРЕЕ ТЕМП И ВЫШЕ ТОН, шаги и серво-трещотка
+          учащаются вместе со скоростью
+    • в меню: переключатель «Звук» и ползунок «Громкость»
+
+    УПРАВЛЕНИЕ
+    • «Щупальца» — вкл/выкл (выдвигаются из портала на спине)
+    • «Ползание» — идёшь в стену и ползёшь по стенам/потолкам; прыжок = рывок
+    • «Кол-во» — сколько щупалец (1–4), «Скорость» — множитель скорости
+    • меню перетаскивается за шапку, сворачивается кнопкой «–», «×» — выгрузить скрипт
+]]
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local Workspace        = game:GetService("Workspace")
+local SoundService     = game:GetService("SoundService")
+local ContentProvider  = game:GetService("ContentProvider")
+
+local LP = Players.LocalPlayer
+if not LP then return end
+
+-- ── убираем прошлый запуск (если скрипт выполнили второй раз) ──────────────
+local genv = _G
+pcall(function() if getgenv then genv = getgenv() end end)
+if genv.__OCTOARMS_CLEANUP then pcall(genv.__OCTOARMS_CLEANUP) end
+
+-- ══════════════════════════ НАСТРОЙКИ ═════════════════════════════════════
+local CFG = {
+    enabled = false,   -- щупальца включены
+    crawl   = false,   -- ползание по стенам
+    count   = 4,       -- сколько щупалец активно (1..4)
+    speed   = 1,       -- множитель скорости
+    sound   = true,    -- звуки включены
+    volume  = 1,       -- общая громкость (0..2)
+}
+
+local SEGMENTS = 10       -- звеньев в щупальце
+local LENGTH   = 12.5     -- длина щупальца (студы)
+local LIFT     = 3.6      -- на сколько щупальца поднимают тело
+local FOOT_OFF = 1.05     -- высота запястья клешни над поверхностью
+local THICK_A  = 0.72     -- толщина у основания
+local THICK_B  = 0.30     -- толщина у запястья
+
+local SPEED_MIN, SPEED_MAX = 0.5, 6
+
+-- ── палитра «Рик и Морти» ──
+local PORTAL   = Color3.fromRGB(105, 255, 70)   -- зелёный портал Рика
+local PORTAL_D = Color3.fromRGB(10, 52, 18)     -- «глубина» портала
+local ACCENT   = PORTAL
+local GUN      = Color3.fromRGB(24, 27, 33)     -- глянцевый чёрный
+local GUN2     = Color3.fromRGB(56, 62, 72)
+local SILVER   = Color3.fromRGB(176, 192, 208)  -- серебро / цвет халата и волос Рика
+local WHITE    = Color3.new(1, 1, 1)
+
+-- Слоты щупалец. Координаты относительно тела: x — вправо, z — НАЗАД (спина).
+-- group — диагональные пары шагают по очереди (как у краба/паука)
+local SLOTS = {
+    { anchor = Vector3.new( 0.5,  0.95, 0.62), home = Vector3.new( 4.6, 0, -2.6), group = 1 }, -- перед-право
+    { anchor = Vector3.new(-0.5,  0.95, 0.62), home = Vector3.new(-4.6, 0, -2.6), group = 2 }, -- перед-лево
+    { anchor = Vector3.new(-0.5, -0.25, 0.62), home = Vector3.new(-4.6, 0,  3.4), group = 1 }, -- зад-лево
+    { anchor = Vector3.new( 0.5, -0.25, 0.62), home = Vector3.new( 4.6, 0,  3.4), group = 2 }, -- зад-право
+}
+
+-- ══════════════════════════ УТИЛИТЫ ═══════════════════════════════════════
+local connections = {}
+local function track(c) table.insert(connections, c); return c end
+
+local function lerp(a, b, t) return a + (b - a) * t end
+local function rnd(a, b) return a + (b - a) * math.random() end
+local function jit(x, k) return x * (1 + (math.random() - 0.5) * 2 * k) end
+
+-- пружина (работает и для чисел, и для Vector3) — отсюда вся «эластичность»
+local function spring(pos, vel, target, k, d, dt)
+    local n = math.max(1, math.ceil(dt * 120))
+    local h = dt / n
+    for _ = 1, n do
+        vel = vel + ((target - pos) * k - vel * d) * h
+        pos = pos + vel * h
+    end
+    return pos, vel
+end
+
+local function bez(p0, p1, p2, p3, t)
+    local u = 1 - t
+    return p0 * (u * u * u) + p1 * (3 * u * u * t) + p2 * (3 * u * t * t) + p3 * (t * t * t)
+end
+
+-- CFrame цилиндра: ось X смотрит вдоль dir
+local function cylCF(pos, dir)
+    local ref = Vector3.new(0, 1, 0)
+    if math.abs(dir.Y) > 0.97 then ref = Vector3.new(1, 0, 0) end
+    local z = dir:Cross(ref).Unit
+    local y = z:Cross(dir)
+    return CFrame.fromMatrix(pos, dir, y)
+end
+
+local function perp(n)
+    local a = math.abs(n.Y) < 0.9 and Vector3.new(0, 1, 0) or Vector3.new(1, 0, 0)
+    return n:Cross(a).Unit
+end
+
+local function newPart(shape, color, material, parent)
+    local p = Instance.new("Part")
+    p.Anchored = true
+    p.CanCollide = false
+    p.CanTouch = false
+    p.CanQuery = false
+    p.Massless = true
+    p.Shape = shape
+    p.Material = material
+    p.Color = color
+    p.Size = Vector3.new(1, 1, 1)
+    p.TopSurface = Enum.SurfaceType.Smooth
+    p.BottomSurface = Enum.SurfaceType.Smooth
+    p.Parent = parent
+    return p
+end
+
+local function sz(v) return math.max(v, 0.02) end
+
+-- ══════════════════════════ ЛУЧИ / ЗЕМЛЯ ══════════════════════════════════
+local container = Instance.new("Folder")
+container.Name = "OA_" .. tostring(math.random(10000, 99999))
+container.Parent = Workspace
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+pcall(function() rayParams.RespectCanCollide = true end)
+
+local function ray(origin, dir)
+    return Workspace:Raycast(origin, dir, rayParams)
+end
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- ══════════════════════════ ЗВУКОВОЙ ДВИЖОК ═══════════════════════════════
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Идея: берём встроенные сэмплы клиента Roblox (rbxasset://sounds/…) — они есть
+-- у всех и всегда грузятся — и превращаем их в «железо» через эффекты
+-- (Equalizer / Distortion / Reverb / Flange) и PlaybackSpeed (тон + скорость).
+-- Каждый звук — это «слой»; каждое событие (шаг, выдвижение…) — набор слоёв.
+-- ───────────────────────────────────────────────────────────────────────────
+
+-- Свои звуки (необязательно): "rbxassetid://ID" будет приоритетнее встроенных.
+-- Ключи: thud, land, bass, snap, ping, hiss, swish, step
+local CUSTOM = {
+    -- land = "rbxassetid://0",
+}
+
+local SRC = {
+    thud  = { "rbxasset://sounds/impact_explosion_03.mp3" },
+    land  = { "rbxasset://sounds/action_jump_land.mp3" },
+    bass  = { "rbxasset://sounds/bass.wav", "rbxasset://sounds/bass.mp3" },
+    snap  = { "rbxasset://sounds/snap.mp3", "rbxasset://sounds/clickfast.mp3", "rbxasset://sounds/clickfast.wav" },
+    ping  = { "rbxasset://sounds/electronicpingshort.wav", "rbxasset://sounds/electronicpingshort.mp3",
+              "rbxasset://sounds/button.wav", "rbxasset://sounds/button.mp3" },
+    hiss  = { "rbxasset://sounds/impact_water.mp3" },
+    swish = { "rbxasset://sounds/action_get_up.mp3" },
+    step  = { "rbxasset://sounds/action_footsteps_plastic.mp3", "rbxasset://sounds/bfsl-minifigfoots1.mp3" },
+}
+-- если какого-то файла нет в клиенте — подставляем похожий
+local FALLBACK = { ping = "snap", step = "land", bass = "land", swish = "hiss" }
+
+local bank = {}
+for key, list in pairs(SRC) do
+    local l = {}
+    if CUSTOM[key] then table.insert(l, CUSTOM[key]) end
+    for _, url in ipairs(list) do table.insert(l, url) end
+    bank[key] = l -- пока оптимистично; ниже проверим, какие реально грузятся
+end
+
+-- слои: src — сэмпл, vol — громкость, dur — сколько секунд сэмпла играть,
+-- n — голосов в пуле, eq = {низ, середина, верх} в дБ, dist — «грязь»,
+-- rev = {затухание, уровень}, flange = {глубина, микс, частота}
+local LAYERS = {
+    thump = { src = "land",  vol = 2.4, dur = 0.42, n = 8,  eq = { 9, 0, -16 },   dist = 0.30 },
+    clank = { src = "step",  vol = 1.5, dur = 0.16, n = 8,  eq = { -14, 5, 10 },  dist = 0.50, rev = { 0.5, -9 } },
+    punch = { src = "bass",  vol = 1.8, dur = 0.30, n = 6,  eq = { 8, -2, -12 },  dist = 0.20 },
+    tick  = { src = "snap",  vol = 1.0, dur = 0.14, n = 10, eq = { -20, 3, 9 },   dist = 0.35 },
+    chirp = { src = "ping",  vol = 0.9, dur = 0.60, n = 5,  eq = { -10, 2, 6 },   dist = 0.25, flange = { 0.8, 0.5, 1.5 } },
+    hiss  = { src = "hiss",  vol = 1.0, dur = 1.00, n = 4,  eq = { -45, -8, 10 }, rev = { 0.6, -10 } },
+    swish = { src = "swish", vol = 1.3, dur = 0.50, n = 6,  eq = { -12, 3, 7 } },
+    boom  = { src = "thud",  vol = 1.3, dur = 1.30, n = 4,  eq = { 10, -3, -22 }, dist = 0.10, rev = { 1.4, -6 } },
+    power = { src = "bass",  vol = 1.5, dur = 0.70, n = 3,  eq = { 3, 5, -6 },    dist = 0.35, flange = { 0.9, 0.6, 0.8 } },
+    zap   = { src = "snap",  vol = 1.2, dur = 0.22, n = 6,  eq = { -25, 0, 10 },  dist = 0.75 },
+}
+
+local audio = {
+    s = 0,          -- нормированная скорость 0..1 (от неё зависят тон и темп)
+    servoAt = 0,    -- когда играть следующий серво-щелчок
+    dead = false,
+}
+
+local pools, active, timers = {}, {}, {}
+local emitters = {}   -- «источники звука» в мире: [0] — портал на спине, [1..4] — кончики щупалец
+
+local sfxGroup = Instance.new("SoundGroup")
+sfxGroup.Name = "OA_SFX"
+sfxGroup.Volume = CFG.volume
+sfxGroup.Parent = SoundService
+
+local function mk(class, props, parent)
+    local ok, o = pcall(Instance.new, class)
+    if not ok or not o then return nil end
+    for k, v in pairs(props) do pcall(function() o[k] = v end) end
+    o.Parent = parent
+    return o
+end
+
+for name, def in pairs(LAYERS) do
+    local P = { def = def, i = 1, v = {} }
+    for k = 1, def.n do
+        local snd = mk("Sound", {
+            Name = "oa_" .. name, Volume = 0, Looped = false,
+            RollOffMinDistance = 40, RollOffMaxDistance = 400,
+            RollOffMode = Enum.RollOffMode.InverseTapered,
+        }, nil)
+        if snd then
+            pcall(function() snd.SoundGroup = sfxGroup end)
+            local first = bank[def.src] and bank[def.src][1]
+            if first then snd.SoundId = first end -- чтобы ассет начал грузиться заранее
+            if def.eq then
+                mk("EqualizerSoundEffect", { LowGain = def.eq[1], MidGain = def.eq[2], HighGain = def.eq[3] }, snd)
+            end
+            if def.dist then mk("DistortionSoundEffect", { Level = def.dist }, snd) end
+            if def.flange then
+                mk("FlangeSoundEffect", { Depth = def.flange[1], Mix = def.flange[2], Rate = def.flange[3] }, snd)
+            end
+            if def.rev then
+                mk("ReverbSoundEffect", { DecayTime = def.rev[1], WetLevel = def.rev[2], DryLevel = 0 }, snd)
+            end
+            P.v[k] = { snd = snd, n = k, vol = 0, stopAt = 0 }
+        end
+    end
+    pools[name] = P
+end
+
+-- проверяем, какие сэмплы реально существуют в этом клиенте (в фоне)
+task.spawn(function()
+    local good, total = {}, 0
+    for key, list in pairs(bank) do
+        good[key] = {}
+        for _, url in ipairs(list) do
+            if audio.dead then return end
+            local ok = true
+            local probe = Instance.new("Sound")
+            probe.SoundId = url
+            pcall(function()
+                ContentProvider:PreloadAsync({ probe }, function(_, status)
+                    local s = tostring(status)
+                    if s:find("Failure") or s:find("TimedOut") then ok = false end
+                end)
+            end)
+            pcall(function() probe:Destroy() end)
+            if ok then
+                table.insert(good[key], url)
+                total = total + 1
+            end
+        end
+    end
+    if total == 0 then return end -- PreloadAsync не сработал — оставляем всё как есть
+    for key, fb in pairs(FALLBACK) do
+        if #good[key] == 0 and good[fb] and #good[fb] > 0 then good[key] = good[fb] end
+    end
+    for key, list in pairs(good) do bank[key] = list end
+end)
+
+-- проиграть слой. o: pitch (тон/скорость), vol, delay (сек), em (откуда звучит),
+-- sweep = {тон_с, тон_до, сек} — плавное изменение тона, len — сколько секунд играть
+local function play(layer, o)
+    o = o or {}
+    if not CFG.sound or audio.dead then return end
+    local d = o.delay
+    if d and d > 0 then
+        o.delay = nil
+        timers[#timers + 1] = { at = os.clock() + d, fn = function() play(layer, o) end }
+        return
+    end
+    local P = pools[layer]
+    if not P then return end
+    local def = P.def
+    local list = bank[def.src]
+    if not list or #list == 0 then return end
+    local v = P.v[P.i]
+    if not v then return end
+    P.i = P.i % #P.v + 1
+    local snd = v.snd
+    v.n = v.n + 1
+    local url = list[(v.n % #list) + 1]
+    if snd.SoundId ~= url then snd.SoundId = url end
+    local pitch = math.max(o.pitch or 1, 0.05)
+    local startPitch = o.sweep and o.sweep[1] or pitch
+    local vol = (o.vol or 1) * def.vol
+    local em = o.em or emitters[0]
+    snd:Stop()
+    if snd.Parent ~= em then snd.Parent = em end
+    snd.PlaybackSpeed = startPitch
+    snd.Volume = vol
+    snd.TimePosition = 0
+    snd:Play()
+    local now = os.clock()
+    local avg = o.sweep and (o.sweep[1] + o.sweep[2]) * 0.5 or pitch
+    v.vol = vol
+    v.stopAt = now + (o.len or (def.dur / math.max(avg, 0.05)))
+    v.sw = o.sweep and { o.sweep[1], o.sweep[2], o.sweep[3], now } or nil
+    active[v] = true
+end
+
+-- вызывается каждый кадр: обрывает звуки в срок (с короткой «затухалкой»),
+-- крутит тон у sweep-звуков и запускает отложенные звуки
+local function sfxUpdate(now)
+    for v in pairs(active) do
+        local snd = v.snd
+        local rem = v.stopAt - now
+        if rem <= 0 then
+            snd:Stop()
+            snd.Volume = 0
+            active[v] = nil
+        else
+            if rem < 0.05 then snd.Volume = v.vol * (rem / 0.05) end
+            local sw = v.sw
+            if sw then
+                local a = math.clamp((now - sw[4]) / math.max(sw[3], 0.01), 0, 1)
+                snd.PlaybackSpeed = sw[1] + (sw[2] - sw[1]) * a
+            end
+        end
+    end
+    for i = #timers, 1, -1 do
+        local tm = timers[i]
+        if tm and now >= tm.at then
+            table.remove(timers, i)
+            pcall(tm.fn)
+        end
+    end
+end
+
+-- искры (зелёные) из источника
+local function newSparks(parent, size, lo, hi)
+    local ok, pe = pcall(function()
+        local p = Instance.new("ParticleEmitter")
+        p.Rate = 0
+        p.Lifetime = NumberRange.new(0.25, 0.6)
+        p.Speed = NumberRange.new(lo, hi)
+        p.SpreadAngle = Vector2.new(180, 180)
+        p.Acceleration = Vector3.new(0, -40, 0)
+        p.Drag = 3
+        p.LightEmission = 1
+        p.LightInfluence = 0
+        p.Color = ColorSequence.new(WHITE, PORTAL)
+        p.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, size), NumberSequenceKeypoint.new(1, 0) })
+        p.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 1) })
+        p.Parent = parent
+        return p
+    end)
+    return ok and pe or nil
+end
+
+-- «источники звука» в мире (невидимые якорные части)
+for i = 0, 4 do
+    local e = newPart(Enum.PartType.Block, WHITE, Enum.Material.SmoothPlastic, container)
+    e.Name = "snd" .. i
+    e.Transparency = 1
+    e.Size = Vector3.new(0.3, 0.3, 0.3)
+    emitters[i] = e
+end
+local portalSparks = newSparks(emitters[0], 0.35, 8, 20)
+local portalLight = mk("PointLight", { Color = PORTAL, Range = 14, Brightness = 0 }, emitters[0])
+
+local function sparks(t, n)
+    if t.sparks then pcall(function() t.sparks:Emit(math.floor(n)) end) end
+end
+
+-- ───────────────────────────── ЗВУКОВЫЕ СОБЫТИЯ ───────────────────────────
+local SFX = {}
+
+-- ТЯЖЁЛЫЙ ШАГ: удар + металлический лязг + бас. Чем выше скорость s —
+-- тем выше тон и громче, а сам звук короче (шаги сыплются быстрее).
+function SFX.plant(t, crawling, strong)
+    local s = audio.s
+    local k = strong or 1
+    local em = t.emitter
+    local vol = lerp(1.0, 1.25, s) * k
+    play("thump", { em = em, pitch = jit(lerp(0.56, 1.12, s), 0.06), vol = vol })
+    play("clank", { em = em, pitch = jit(lerp(0.62, 1.35, s), 0.08), vol = vol * 0.9, delay = 0.004 })
+    play("punch", { em = em, pitch = jit(lerp(0.85, 1.5, s), 0.05), vol = vol * 0.8 })
+    if crawling then
+        -- «цап» когтей по стене / потолку
+        play("tick",  { em = em, pitch = jit(lerp(0.7, 1.2, s), 0.1), vol = 1.0, delay = 0.03 })
+        play("swish", { em = em, pitch = jit(lerp(1.5, 2.4, s), 0.1), vol = 0.5, delay = 0.01 })
+    end
+    sparks(t, lerp(3, 8, s))
+end
+
+-- щупальце отрывается от земли для шага: серво-щелчок + свист
+function SFX.lift(t)
+    local s = audio.s
+    play("tick", { em = t.emitter, pitch = jit(lerp(1.3, 2.3, s), 0.1), vol = 0.55 })
+    if s < 0.75 then
+        play("swish", { em = t.emitter, pitch = jit(lerp(1.3, 2.2, s), 0.1), vol = lerp(0.35, 0.6, s) })
+    end
+end
+
+-- портал на спине открывается
+function SFX.portalOpen()
+    local em = emitters[0]
+    play("zap",   { em = em, pitch = 2.0, vol = 1.0 })
+    play("zap",   { em = em, pitch = 2.6, vol = 0.9, delay = 0.05 })
+    play("zap",   { em = em, pitch = 3.2, vol = 0.8, delay = 0.11 })
+    play("power", { em = em, pitch = 1.0, sweep = { 0.6, 2.4, 0.5 }, len = 0.55, vol = 1.0 })
+    play("chirp", { em = em, pitch = 1.0, sweep = { 0.8, 2.6, 0.45 }, len = 0.5, vol = 0.8 })
+    play("hiss",  { em = em, pitch = 1.5, vol = 0.8, delay = 0.05 })
+    play("boom",  { em = em, pitch = 1.4, vol = 0.7, delay = 0.12 })
+    if portalSparks then pcall(function() portalSparks:Emit(40) end) end
+end
+
+-- портал закрывается
+function SFX.portalClose()
+    local em = emitters[0]
+    play("power", { em = em, pitch = 1.0, sweep = { 2.0, 0.45, 0.5 }, len = 0.55, vol = 1.0 })
+    play("hiss",  { em = em, pitch = 1.2, vol = 0.8 })
+    play("boom",  { em = em, pitch = 1.0, vol = 0.9, delay = 0.45 })
+    play("zap",   { em = em, pitch = 1.4, vol = 0.9, delay = 0.5 })
+    if portalSparks then pcall(function() portalSparks:Emit(25) end) end
+end
+
+-- одно щупальце выдвигается: трещотка (серво) с растущим тоном
+function SFX.unfold(t)
+    local em = t.emitter
+    local at = 0
+    for i = 1, 9 do
+        play("tick", { em = em, pitch = 1.0 + i * 0.14, vol = 0.8, delay = at })
+        at = at + 0.075 - i * 0.004
+    end
+    play("chirp", { em = em, pitch = 1.0, sweep = { 0.9, 2.2, 0.5 }, len = 0.5, vol = 0.7 })
+    play("swish", { em = em, pitch = 1.1, vol = 0.9, delay = 0.05 })
+    play("hiss",  { em = em, pitch = 2.3, vol = 0.35, delay = 0.1 })
+end
+
+-- щупальце бьёт лапой в землю после выдвижения
+function SFX.slam(t)
+    SFX.plant(t, false, 1.5)
+    play("boom", { em = t.emitter, pitch = 1.1, vol = 0.5 })
+end
+
+-- щупальце втягивается: обратная трещотка + щелчок замка
+function SFX.fold(t)
+    local em = t.emitter
+    local at = 0
+    for i = 1, 8 do
+        play("tick", { em = em, pitch = 2.3 - i * 0.14, vol = 0.8, delay = at })
+        at = at + 0.05 + i * 0.006
+    end
+    play("chirp", { em = em, pitch = 1.0, sweep = { 2.2, 0.8, 0.45 }, len = 0.45, vol = 0.6 })
+    play("hiss",  { em = em, pitch = 1.8, vol = 0.45 })
+    play("thump", { em = em, pitch = 0.9, vol = 1.0, delay = 0.42 })
+    play("clank", { em = em, pitch = 0.8, vol = 1.0, delay = 0.42 })
+end
+
+-- тело поднялось / опустилось на щупальцах (гидравлика)
+function SFX.liftUp()
+    play("hiss",  { pitch = 1.6, vol = 0.7 })
+    play("power", { pitch = 1.0, sweep = { 0.7, 1.3, 0.45 }, len = 0.5, vol = 0.6 })
+    play("punch", { pitch = 0.8, vol = 1.1, delay = 0.4 })
+end
+function SFX.liftDown()
+    play("hiss",  { pitch = 1.3, vol = 0.7 })
+    play("thump", { pitch = 0.7, vol = 1.2, delay = 0.2 })
+end
+
+-- ползание: когти вцепились
+function SFX.clamp()
+    for i = 0, 3 do
+        play("thump", { pitch = 0.6 + i * 0.05, vol = 1.2, delay = i * 0.055 })
+        play("tick",  { pitch = 0.8, vol = 1.0, delay = i * 0.055 })
+    end
+    play("hiss", { pitch = 1.7, vol = 0.6 })
+end
+function SFX.release()
+    play("hiss",  { pitch = 1.3, vol = 0.7 })
+    play("thump", { pitch = 0.8, vol = 1.0 })
+end
+
+-- прыжок-рывок от стены
+function SFX.launch()
+    play("hiss",  { pitch = 1.3, vol = 0.9 })
+    play("zap",   { pitch = 2.2, vol = 0.9 })
+    play("thump", { pitch = 0.8, vol = 1.4 })
+    play("power", { pitch = 1.0, sweep = { 0.8, 2.0, 0.35 }, len = 0.4, vol = 0.7 })
+end
+
+-- приземление / прилипание после полёта
+function SFX.land(impact)
+    local k = math.clamp(impact / 50, 0.5, 1.8)
+    play("thump", { pitch = 0.5, vol = 1.3 * k })
+    play("clank", { pitch = 0.6, vol = 1.0 * k })
+    play("punch", { pitch = 0.7, vol = 1.0 * k })
+    play("boom",  { pitch = 1.3, vol = 0.5 * k })
+    play("hiss",  { pitch = 1.8, vol = 0.4 * k, delay = 0.05 })
+end
+
+-- смена поверхности (угол стены, потолок): когти перехватываются
+function SFX.corner()
+    play("clank", { pitch = 0.7, vol = 1.2 })
+    play("thump", { pitch = 0.7, vol = 1.0 })
+    play("tick",  { pitch = 1.1, vol = 0.9, delay = 0.04 })
+    play("tick",  { pitch = 1.4, vol = 0.9, delay = 0.09 })
+    play("hiss",  { pitch = 2.0, vol = 0.3, delay = 0.03 })
+end
+
+-- ══════════════════════════ ЩУПАЛЬЦА (визуал) ═════════════════════════════
+local tentacles = {}
+
+local function setShown(t, b)
+    if t.shown ~= b then
+        t.shown = b
+        t.folder.Parent = b and container or nil
+        if not b then t.init = false end
+    end
+end
+
+local function resetTentacle(t)
+    t.ext, t.extV = 0, 0
+    t.want = false
+    t.raise = false
+    t.planted = nil
+    t.stepping = false
+    t.tip, t.tipV = Vector3.zero, Vector3.zero
+    t.hs, t.hsV = 0, 0
+    t.need = 0
+    t.active = false
+    t.init = false
+    t.grip, t.gripV = 0.3, 0
+    t.sfxOut, t.sfxFold = false, false
+    t.pendingOut, t.pendingFold = false, false
+    t.slamAt = nil
+    t.lastPlant = 0
+    setShown(t, false)
+end
+
+for i, slot in ipairs(SLOTS) do
+    local t = { slot = slot, idx = i, segs = {}, rings = {}, sleeves = {}, joints = {}, fingers = {}, knuckles = {} }
+    t.folder = Instance.new("Folder")
+    t.folder.Name = "T" .. i
+    for s = 1, SEGMENTS do
+        t.segs[s]  = newPart(Enum.PartType.Cylinder, GUN, Enum.Material.Metal, t.folder)
+        t.segs[s].Reflectance = 0.12
+        t.rings[s] = newPart(Enum.PartType.Cylinder, PORTAL, Enum.Material.Neon, t.folder)
+        if s % 2 == 0 then -- серебристая броня на каждом втором звене
+            t.sleeves[s] = newPart(Enum.PartType.Cylinder, SILVER, Enum.Material.Metal, t.folder)
+            t.sleeves[s].Reflectance = 0.2
+        end
+    end
+    for j = 0, SEGMENTS do
+        t.joints[j] = newPart(Enum.PartType.Ball, GUN2, Enum.Material.Metal, t.folder)
+    end
+    -- клешня: запястье, «глаз»-ладонь и три пальца по две фаланги
+    t.wrist = newPart(Enum.PartType.Cylinder, SILVER, Enum.Material.Metal, t.folder)
+    t.palm  = newPart(Enum.PartType.Ball, PORTAL, Enum.Material.Neon, t.folder)
+    for k = 1, 3 do
+        t.fingers[k] = {
+            newPart(Enum.PartType.Cylinder, SILVER, Enum.Material.Metal, t.folder),
+            newPart(Enum.PartType.Cylinder, GUN2, Enum.Material.Metal, t.folder),
+        }
+        t.knuckles[k] = newPart(Enum.PartType.Ball, GUN, Enum.Material.Metal, t.folder)
+    end
+    -- источник звука / искр на кончике
+    t.emitter = emitters[i]
+    t.sparks = newSparks(t.emitter, 0.22, 6, 14)
+    tentacles[i] = t
+    resetTentacle(t)
+end
+
+-- ПОРТАЛ на спине (как портал Рика): тёмная панель + зелёное кольцо + искры
+local rig = { shown = false, dots = {} }
+rig.plate = newPart(Enum.PartType.Block, GUN, Enum.Material.Metal, nil)
+rig.ring  = newPart(Enum.PartType.Cylinder, PORTAL, Enum.Material.Neon, nil)
+rig.core  = newPart(Enum.PartType.Cylinder, PORTAL_D, Enum.Material.SmoothPlastic, nil)
+for k = 1, 6 do
+    rig.dots[k] = newPart(Enum.PartType.Ball, WHITE, Enum.Material.Neon, nil)
+end
+rig.light = portalLight
+
+local function updateHarness(c, ext, now)
+    local show = ext > 0.02
+    if show ~= rig.shown then
+        rig.shown = show
+        local par = show and container or nil
+        rig.plate.Parent = par
+        rig.ring.Parent = par
+        rig.core.Parent = par
+        for _, d in ipairs(rig.dots) do d.Parent = par end
+        if not show and rig.light then rig.light.Brightness = 0 end
+    end
+    if not show then
+        if portalSparks then portalSparks.Rate = 0 end
+        return
+    end
+    local s = math.clamp(ext * 2.2, 0, 1.15)
+    local base = c.torso.CFrame * CFrame.new(0, 0.3, 0.62)
+    rig.plate.Size = Vector3.new(sz(1.7 * s), sz(2.1 * s), sz(0.34 * s))
+    rig.plate.CFrame = base
+
+    -- сам портал: диск, смотрящий назад
+    local pc = base * CFrame.new(0, 0, 0.3 * s) * CFrame.Angles(0, math.pi / 2, 0)
+    local d = 2.7 * s * (1 + 0.04 * math.sin(now * 14))
+    rig.ring.Size = Vector3.new(sz(0.1 * s), sz(d), sz(d))
+    rig.ring.CFrame = pc
+    rig.ring.Color = PORTAL:Lerp(WHITE, 0.25 + 0.2 * math.sin(now * 9))
+    rig.core.Size = Vector3.new(sz(0.14 * s), sz(d * 0.78), sz(d * 0.78))
+    rig.core.CFrame = pc * CFrame.new(-0.04 * s, 0, 0)
+
+    -- закрученные «искры» в центре портала
+    for k, dot in ipairs(rig.dots) do
+        local a = now * (5 + k * 0.6) + k * 1.05
+        local r = d * (0.12 + 0.2 * ((k % 3) / 3))
+        local ds = sz(0.24 * s * (0.6 + 0.4 * math.sin(now * 11 + k)))
+        dot.Size = Vector3.new(ds, ds, ds)
+        dot.CFrame = base * CFrame.new(math.cos(a) * r, math.sin(a) * r, 0.3 * s + 0.1 * s)
+    end
+
+    if rig.light then rig.light.Brightness = 2.4 * math.clamp(s, 0, 1) end
+    if portalSparks then portalSparks.Rate = (ext > 0.03 and ext < 0.97) and 45 or 0 end
+end
+
+-- рисуем одно щупальце по Безье + «живое» колебание, клешня на конце
+local function drawTentacle(t, base, tip, up, right, now, spd, dt)
+    local ext = math.max(t.ext, 0)
+    local chord = tip - base
+    local d = chord.Magnitude
+    local cdir = d > 1e-3 and chord / d or -up
+
+    local out = right * (t.slot.home.X > 0 and 1 or -1)
+    local p0 = out * 0.9 + up * 0.8
+    p0 = p0 - cdir * p0:Dot(cdir)
+    if p0.Magnitude < 1e-3 then p0 = up - cdir * up:Dot(cdir) end
+    if p0.Magnitude < 1e-3 then p0 = out end
+    local pole = p0.Unit
+
+    -- высота дуги: чтобы длина кривой ≈ LENGTH (звенья не растягиваются зря)
+    local slack = math.max(LENGTH * LENGTH - d * d, 0)
+    local hT = math.clamp(0.66 * math.sqrt(slack), 0.7, LENGTH * 0.62)
+    t.hs, t.hsV = spring(t.hs, t.hsV, hT + (t.stepping and 0.7 or 0), 90, 7, dt)
+    local h = math.max(t.hs, 0.3)
+
+    local c1 = base + pole * h + cdir * (d * 0.12)
+    local c2 = tip + up * (h * 0.7 + 0.8) + pole * (h * 0.2)
+
+    -- змеиная волна: при выдвижении щупальце «хлещет», на бегу колеблется быстрее
+    local side = cdir:Cross(pole)
+    local whip = t.raise and 2.6 or 1
+    local amp = (0.09 + math.min(spd, 60) * 0.006) * whip
+    local freq = 3.2 + math.min(spd, 60) * 0.04
+    local P = {}
+    for i = 0, SEGMENTS do
+        local s = i / SEGMENTS
+        local p = bez(base, c1, c2, tip, s)
+        local w = math.sin(math.pi * s)
+        p = p + side * (math.sin(now * freq + s * 6 + t.idx * 1.9) * amp * w)
+              + pole * (math.sin(now * freq * 0.72 + s * 5 + t.idx) * amp * 0.7 * w)
+        P[i] = base + (p - base) * ext
+    end
+
+    local scale = math.clamp(ext, 0, 1.12)
+    local energy = t.stepping and 0.35 or 0
+    for i = 1, SEGMENTS do
+        local a, b = P[i - 1], P[i]
+        local dv = b - a
+        local len = dv.Magnitude
+        local sN = (i - 1) / (SEGMENTS - 1)
+        local thick = (THICK_B + (THICK_A - THICK_B) * (1 - sN) ^ 1.4) * scale
+        if len > 1e-3 then
+            local dirv = dv / len
+            local seg, ring = t.segs[i], t.rings[i]
+            seg.Size = Vector3.new(sz(len * 1.04), sz(thick * 0.84), sz(thick * 0.84))
+            seg.CFrame = cylCF((a + b) * 0.5, dirv)
+            -- неоновое кольцо у конца звена + бегущий по щупальцу «заряд»
+            ring.Size = Vector3.new(sz(len * 0.1), sz(thick * 1.14), sz(thick * 1.14))
+            ring.CFrame = cylCF(a + dv * 0.74, dirv)
+            local pulse = 0.5 + 0.5 * math.sin(now * 7 - i * 0.8 + t.idx)
+            ring.Color = PORTAL:Lerp(WHITE, math.clamp(pulse * 0.5 + energy, 0, 1))
+            local sl = t.sleeves[i]
+            if sl then
+                sl.Size = Vector3.new(sz(len * 0.5), sz(thick * 1.02), sz(thick * 1.02))
+                sl.CFrame = cylCF(a + dv * 0.34, dirv)
+            end
+        end
+        local js = sz(thick * (i == 1 and 1.7 or 1.12))
+        local j = t.joints[i - 1]
+        j.Size = Vector3.new(js, js, js)
+        j.Position = a
+    end
+
+    -- кончик + клешня
+    local tipP = P[SEGMENTS]
+    local lastJ = t.joints[SEGMENTS]
+    local ls = sz(THICK_B * scale * 1.3)
+    lastJ.Size = Vector3.new(ls, ls, ls)
+    lastJ.Position = tipP
+
+    local dir = tipP - P[SEGMENTS - 1]
+    if dir.Magnitude < 1e-3 then dir = -up else dir = dir.Unit end
+    local u = perp(dir)
+    local w2 = dir:Cross(u)
+
+    -- запястье + светящаяся «ладонь»
+    local wl = 0.36 * scale
+    t.wrist.Size = Vector3.new(sz(wl), sz(THICK_B * scale * 1.5), sz(THICK_B * scale * 1.5))
+    t.wrist.CFrame = cylCF(tipP + dir * (wl * 0.5), dir)
+    local palmP = tipP + dir * (0.3 * scale)
+    local pulseP = 0.5 + 0.5 * math.sin(now * 8 + t.idx * 2)
+    local ps = sz(0.52 * scale * (1 + 0.18 * pulseP + energy * 0.4))
+    t.palm.Size = Vector3.new(ps, ps, ps)
+    t.palm.Position = palmP
+
+    -- пальцы: в воздухе сложены «копьём», на земле растопырены и впиваются
+    local g = math.clamp(t.grip, 0, 1.15)
+    local th1 = lerp(0.35, 1.02, g)
+    local th2 = lerp(0.06, 0.42, g)
+    local L1, L2 = 0.66 * scale, 0.5 * scale
+    local fw = sz(0.2 * scale)
+    for k = 1, 3 do
+        local ang = (k - 1) * (2 * math.pi / 3) + 0.5 + t.idx * 0.3
+        local rdir = u * math.cos(ang) + w2 * math.sin(ang)
+        local d1 = (dir * math.cos(th1) + rdir * math.sin(th1)).Unit
+        local p1 = palmP + d1 * L1
+        local d2 = (dir * math.cos(th2) + rdir * math.sin(th2)).Unit
+        local f = t.fingers[k]
+        f[1].Size = Vector3.new(sz(L1), fw, fw)
+        f[1].CFrame = cylCF(palmP + d1 * (L1 * 0.5), d1)
+        f[2].Size = Vector3.new(sz(L2), sz(fw * 0.8), sz(fw * 0.8))
+        f[2].CFrame = cylCF(p1 + d2 * (L2 * 0.5), d2)
+        local ks = sz(0.24 * scale)
+        local kn = t.knuckles[k]
+        kn.Size = Vector3.new(ks, ks, ks)
+        kn.Position = p1
+    end
+end
+
+-- ══════════════════════════ КОНТЕКСТ ПЕРСОНАЖА ════════════════════════════
+local ctx = nil
+local controls = nil
+
+task.spawn(function()
+    pcall(function()
+        local pm = require(LP:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule"))
+        controls = pm:GetControls()
+    end)
+end)
+
+local function findMotor(char, names)
+    for _, d in ipairs(char:GetDescendants()) do
+        if d:IsA("Motor6D") then
+            for _, n in ipairs(names) do
+                if d.Name == n then return d end
+            end
+        end
+    end
+    return nil
+end
+
+local MOTOR_DEFS = {
+    { names = { "RightShoulder", "Right Shoulder" }, kind = "arm", side =  1 },
+    { names = { "LeftShoulder",  "Left Shoulder"  }, kind = "arm", side = -1 },
+    { names = { "RightHip",      "Right Hip"      }, kind = "leg", side =  1 },
+    { names = { "LeftHip",       "Left Hip"       }, kind = "leg", side = -1 },
+}
+
+local function bind(char)
+    local hum  = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not root then return false end
+    local torso = char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso") or root
+    ctx = {
+        char = char, hum = hum, root = root, torso = torso,
+        r15 = hum.RigType == Enum.HumanoidRigType.R15,
+        origHip = hum.HipHeight, baseSpeed = hum.WalkSpeed,
+        animate = char:FindFirstChild("Animate"),
+        on = false, crawling = false,
+        lift = 0, liftV = 0, anyPlanted = false, wasPlanted = false,
+        lastPos = root.Position, vel = Vector3.zero,
+        pose = 0, poseV = 0, posed = false, phase = 0,
+        hipDirty = false, motors = {},
+        n = Vector3.new(0, 1, 0), face = Vector3.new(0, 0, -1),
+        cpos = root.Position, cvel = Vector3.zero, air = false,
+        noStick = 0, wishLast = Vector3.zero,
+        refN = nil, lastClank = 0,
+    }
+    for _, def in ipairs(MOTOR_DEFS) do
+        local m = findMotor(char, def.names)
+        if m then
+            table.insert(ctx.motors, { m = m, c0 = m.C0, kind = def.kind, side = def.side })
+        end
+    end
+    rayParams.FilterDescendantsInstances = { char, container }
+    for _, t in ipairs(tentacles) do resetTentacle(t) end
+    return true
+end
+
+local function standH(c)
+    return c.origHip + (c.r15 and 0 or 2) + c.root.Size.Y * 0.5
+end
+
+-- поза ползания: руки тянутся вперёд-вверх, ноги волочатся (анимация через C0)
+local function applyPose(c, alpha, phase)
+    for _, e in ipairs(c.motors) do
+        local sw = math.sin(phase + (e.side == 1 and 0 or math.pi)) * 0.35 * alpha
+        local R
+        if e.kind == "arm" then
+            R = CFrame.Angles(0, 0, e.side * 0.45 * alpha) * CFrame.Angles(2.3 * alpha + sw, 0, 0)
+        else
+            R = CFrame.Angles(0, 0, e.side * 0.22 * alpha) * CFrame.Angles(-0.35 * alpha - sw * 0.8, 0, 0)
+        end
+        local p = e.c0.Position
+        local rot = CFrame.new(-p) * e.c0
+        e.m.C0 = CFrame.new(p) * R * rot
+    end
+end
+
+-- ══════════════════════════ ПОЛЗАНИЕ ПО СТЕНАМ ════════════════════════════
+local function getMoveVector()
+    if controls then
+        local ok, v = pcall(function() return controls:GetMoveVector() end)
+        if ok and typeof(v) == "Vector3" then return v end
+    end
+    local c, cam = ctx, Workspace.CurrentCamera
+    if c and cam then
+        local look = cam.CFrame.LookVector
+        local flat = Vector3.new(look.X, 0, look.Z)
+        if flat.Magnitude > 0.01 then
+            local f = CFrame.new(Vector3.new(0, 0, 0), flat.Unit)
+            return f:VectorToObjectSpace(c.hum.MoveDirection)
+        end
+    end
+    return Vector3.zero
+end
+
+-- ищем поверхность: стена впереди / выпуклый угол / то, на чём стоим
+local function pickSurface(origin, n, wd, hover)
+    local reach = hover + 2.6
+    if wd then
+        local r = ray(origin, wd * (hover + 0.9))
+        if r and r.Normal:Dot(n) < 0.85 then
+            return r.Position + r.Normal * hover, r.Normal
+        end
+    end
+    local r = ray(origin, -n * reach)
+    if r then
+        if wd then
+            local ahead = ray(origin + wd * 2.4, -n * reach)
+            if not ahead then
+                local c = ray(origin + wd * 2.4 - n * (hover + 1.2), -wd * 4.2)
+                if c then return c.Position + c.Normal * hover, c.Normal end
+            end
+        end
+        return r.Position + r.Normal * hover, r.Normal
+    end
+    if wd then
+        local a = ray(origin + wd * 2.4, -n * reach)
+        if a then return a.Position + a.Normal * hover, a.Normal end
+    end
+    local g = ray(origin, Vector3.new(0, -1, 0) * reach)
+    if g then return g.Position + g.Normal * hover, g.Normal end
+    return nil
+end
+
+local function enterCrawl(c)
+    local up = c.root.CFrame.UpVector
+    if up.Y < 0.5 then up = Vector3.new(0, 1, 0) end
+    c.n = up.Unit
+    c.cpos = c.root.Position
+    c.face = c.root.CFrame.LookVector
+    c.cvel = Vector3.zero
+    c.air = false
+    c.noStick = 0
+    c.refN = nil
+    c.hum.PlatformStand = true
+    SFX.clamp()
+end
+
+local function exitCrawl(c)
+    c.hum.PlatformStand = false
+    local pos = c.root.Position
+    local flat = Vector3.new(c.face.X, 0, c.face.Z)
+    if flat.Magnitude < 0.05 then flat = Vector3.new(0, 0, -1) end
+    c.root.CFrame = CFrame.new(pos, pos + flat.Unit)
+    c.root.AssemblyLinearVelocity = Vector3.zero
+    c.root.AssemblyAngularVelocity = Vector3.zero
+    c.n = Vector3.new(0, 1, 0)
+    pcall(function() c.hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+    SFX.release()
+end
+
+local function crawlStep(c, dt, now, lift)
+    local hum, root = c.hum, c.root
+    local cam = Workspace.CurrentCamera
+    local n = c.n
+
+    -- направление движения в плоскости поверхности (относительно камеры)
+    local mv = getMoveVector()
+    local wish = Vector3.zero
+    if cam and mv.Magnitude > 0.08 then
+        local cf = cam.CFrame
+        local f1 = cf.LookVector - n * cf.LookVector:Dot(n)
+        local f2 = cf.UpVector - n * cf.UpVector:Dot(n)
+        local f = f1 + f2 * (1 - math.min(f1.Magnitude, 1))
+        if f.Magnitude > 1e-3 then
+            local r = cf.RightVector - n * cf.RightVector:Dot(n)
+            if r.Magnitude < 1e-3 then r = f:Cross(n) end
+            wish = f.Unit * (-mv.Z) + r.Unit * mv.X
+            if wish.Magnitude > 1 then wish = wish.Unit end
+        end
+    end
+    c.wishLast = wish
+
+    local spd = hum.WalkSpeed
+    local hover = standH(c) + lift
+    local wd = wish.Magnitude > 0.1 and wish.Unit or nil
+
+    local newPos
+    local air = c.air
+    if air then
+        c.cvel = c.cvel + Vector3.new(0, -Workspace.Gravity, 0) * dt
+        newPos = c.cpos + c.cvel * dt + wish * spd * 0.3 * dt
+    else
+        newPos = c.cpos + wish * spd * dt
+    end
+
+    local tPos, tN
+    if now >= c.noStick then
+        tPos, tN = pickSurface(newPos, n, wd, hover)
+    end
+    if tPos then
+        if air then
+            local impact = c.cvel.Magnitude
+            if impact > 12 then SFX.land(impact) end -- тяжёлое приземление
+            air = false
+            c.cvel = Vector3.zero
+        end
+        -- сменилась поверхность (угол стены / потолок) — когти перехватываются с лязгом
+        if not c.refN then c.refN = tN end
+        if tN:Dot(c.refN) < 0.75 and now - c.lastClank > 0.25 then
+            c.refN = tN
+            c.lastClank = now
+            SFX.corner()
+        end
+        newPos = newPos + (tPos - newPos) * (1 - math.exp(-dt * 16))
+        local nn = n:Lerp(tN, 1 - math.exp(-dt * 11))
+        if nn.Magnitude > 0.05 then n = nn.Unit else n = tN end
+    else
+        air = true
+        local nn = n:Lerp(Vector3.new(0, 1, 0), 1 - math.exp(-dt * 3))
+        if nn.Magnitude > 0.05 then n = nn.Unit end
+    end
+
+    -- куда смотрит тело (по движению)
+    local face = c.face - n * c.face:Dot(n)
+    if face.Magnitude < 0.05 then face = perp(n) end
+    face = face.Unit
+    if wd then
+        local nf = face:Lerp(wd, 1 - math.exp(-dt * 9))
+        if nf.Magnitude > 0.05 then face = nf.Unit end
+    end
+    face = face - n * face:Dot(n)
+    if face.Magnitude < 0.05 then face = perp(n) end
+    face = face.Unit
+
+    c.face, c.n, c.cpos, c.air = face, n, newPos, air
+    root.CFrame = CFrame.fromMatrix(newPos, face:Cross(n), n)
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+end
+
+track(UserInputService.JumpRequest:Connect(function()
+    local c = ctx
+    if c and c.crawling and not c.air then
+        c.air = true
+        c.cvel = c.n * 52 + Vector3.new(0, 14, 0) + c.wishLast * c.hum.WalkSpeed * 0.5
+        c.noStick = os.clock() + 0.22
+        SFX.launch()
+    end
+end))
+
+-- ══════════════════════════ ГЛАВНЫЙ ЦИКЛ ══════════════════════════════════
+local function hideAll()
+    for _, t in ipairs(tentacles) do
+        if t.shown then resetTentacle(t) end
+    end
+    updateHarness(nil, 0, 0)
+end
+
+local function startStep(t, dur)
+    t.stepping = true
+    t.stepT = 0
+    t.stepFrom = t.planted
+    t.dur = dur
+    t.arcH = math.clamp(1.4 + t.need * 0.5, 1.4, 3.2)
+    SFX.lift(t)
+end
+
+local function update(dt)
+    dt = math.clamp(dt, 1 / 240, 1 / 20)
+    local now = os.clock()
+    sfxUpdate(now)
+
+    local char = LP.Character
+    if not char or not char.Parent then hideAll(); ctx = nil; return end
+    if not ctx or ctx.char ~= char then
+        if not bind(char) then return end
+    end
+    local c = ctx
+    local hum, root = c.hum, c.root
+    if not hum.Parent or not root.Parent then return end
+
+    local on = CFG.enabled and hum.Health > 0
+    c.animate = c.animate or char:FindFirstChild("Animate")
+
+    -- «источник» портала всегда следует за спиной (звуки открытия идут оттуда)
+    emitters[0].CFrame = c.torso.CFrame * CFrame.new(0, 0.3, 0.9)
+
+    -- включение / выключение
+    if on ~= c.on then
+        c.on = on
+        if on then
+            c.baseSpeed = hum.WalkSpeed
+            if c.animate then c.animate.Disabled = true end
+            for _, tr in ipairs(hum:GetPlayingAnimationTracks()) do tr:Stop(0.1) end
+            SFX.portalOpen()
+        else
+            if c.animate then c.animate.Disabled = false end
+            hum.WalkSpeed = c.baseSpeed
+            SFX.portalClose()
+        end
+    end
+
+    -- скорость тела
+    local pos = root.Position
+    local rv = (pos - c.lastPos) / dt
+    c.lastPos = pos
+    if rv.Magnitude > 220 then rv = Vector3.zero end
+    c.vel = c.vel:Lerp(rv, 1 - math.exp(-dt * 10))
+    local bodySpeed = c.vel.Magnitude
+
+    -- нормированная скорость для звука: от неё зависят тон, громкость и темп
+    local sTarget = math.clamp((bodySpeed - 4) / 80, 0, 1) ^ 0.85
+    audio.s = audio.s + (sTarget - audio.s) * (1 - math.exp(-dt * 8))
+
+    local crawl = on and CFG.crawl
+    if crawl ~= c.crawling then
+        c.crawling = crawl
+        if crawl then enterCrawl(c) else exitCrawl(c) end
+    end
+
+    -- подъём тела над землёй (эластичная пружина)
+    local liftTarget = (on and c.anyPlanted) and LIFT or 0
+    c.lift, c.liftV = spring(c.lift, c.liftV, liftTarget, 55, 9, dt)
+    local lift = math.max(c.lift, 0)
+
+    if on then
+        local sp = c.baseSpeed * CFG.speed
+        if hum.WalkSpeed ~= sp then hum.WalkSpeed = sp end
+    end
+
+    c.phase = c.phase + dt * (2 + bodySpeed * 0.3)
+    local bob = math.sin(c.phase * 2) * 0.12 * math.min(1, bodySpeed / 12)
+
+    if on or lift > 0.02 then
+        hum.HipHeight = c.origHip + lift + bob
+        c.hipDirty = true
+    elseif c.hipDirty then
+        hum.HipHeight = c.origHip
+        c.hipDirty = false
+    end
+
+    if crawl then crawlStep(c, dt, now, lift + bob) end
+
+    -- поза ползания
+    c.pose, c.poseV = spring(c.pose, c.poseV, crawl and 1 or 0, 45, 9, dt)
+    local pa = math.clamp(c.pose, 0, 1)
+    if pa > 0.01 then
+        applyPose(c, pa, c.phase * 1.6)
+        c.posed = true
+    elseif c.posed then
+        applyPose(c, 0, 0)
+        c.posed = false
+    end
+
+    -- ── система координат тела ──
+    local up = crawl and c.n or Vector3.new(0, 1, 0)
+    local rcf = root.CFrame
+    local right = rcf.RightVector
+    right = right - up * right:Dot(up)
+    if right.Magnitude < 0.1 then right = perp(up) end
+    right = right.Unit
+    local fwd = up:Cross(right)
+    local hover = standH(c) + lift
+
+    local mult = CFG.speed
+    local stepDur = math.clamp(0.2 / math.sqrt(mult), 0.07, 0.28)
+    local thr = math.min(2.2 + 0.7 * (mult - 1), 4.2)
+    local v = c.vel - up * c.vel:Dot(up)
+    local lead = v * (stepDur * 1.2)
+    if lead.Magnitude > 5.5 then lead = lead.Unit * 5.5 end
+
+    -- ── проход 1: состояния, земля, прогресс шага ──
+    local busy = { false, false }
+    local anyPlanted = false
+    local maxExt = 0
+
+    for _, t in ipairs(tentacles) do
+        local slot = t.slot
+        t.need = 0
+        local want = on and t.idx <= CFG.count
+        if want ~= t.want then
+            t.want = want
+            t.raise = true
+            t.stepping = false
+            t.sfxOut, t.sfxFold = false, false
+            t.slamAt = nil
+            if want then
+                t.startAt = now + (t.idx - 1) * 0.11
+                t.raiseEnd = t.startAt + 0.55
+            else
+                t.raiseEnd = math.huge
+                t.foldAt = now + 0.22 + (t.idx - 1) * 0.05
+            end
+        end
+
+        local extTarget = 0
+        if want then
+            if now >= t.startAt then
+                extTarget = 1
+                if not t.sfxOut then t.sfxOut = true; t.pendingOut = true end
+            end
+            if t.raise and now >= t.raiseEnd then
+                t.raise = false
+                t.planted = nil -- «удар» лапой в землю
+                t.slamAt = now
+            end
+        elseif now < (t.foldAt or 0) and t.ext > 0.05 then
+            extTarget = 1
+        elseif t.ext > 0.05 and not t.sfxFold then
+            t.sfxFold = true
+            t.pendingFold = true
+        end
+        t.ext, t.extV = spring(t.ext, t.extV, extTarget, 60, 7, dt) -- упругое выдвижение / втягивание
+        maxExt = math.max(maxExt, t.ext)
+
+        local visible = t.ext > 0.015 or extTarget > 0
+        setShown(t, visible)
+        t.active = visible
+
+        if visible then
+            local anchorW = c.torso.CFrame:PointToWorldSpace(slot.anchor)
+            t.anchorW = anchorW
+            local off = right * slot.home.X + fwd * (-slot.home.Z)
+            local approx = rcf.Position + off
+            local hit = ray(approx + up * 2.5, -up * 30)
+            local ground
+            if hit then
+                ground = hit.Position + hit.Normal * FOOT_OFF
+            else
+                ground = approx - up * hover + up * FOOT_OFF
+            end
+            t.ground = ground
+
+            if not t.init then
+                t.init = true
+                t.tip, t.tipV = anchorW, Vector3.zero
+                t.emitter.Position = anchorW
+            end
+
+            -- звуки выдвижения / втягивания (из позиции щупальца)
+            if t.pendingOut then
+                t.pendingOut = false
+                t.emitter.Position = anchorW
+                SFX.unfold(t)
+            end
+            if t.pendingFold then
+                t.pendingFold = false
+                t.emitter.Position = t.tip
+                SFX.fold(t)
+            end
+
+            if t.raise then
+                local sgn = slot.home.X > 0 and 1 or -1
+                t.target = anchorW + up * (LENGTH * 0.62) + right * (sgn * 2.2)
+                    + fwd * (-slot.home.Z * 0.25)
+                    + right * (math.sin(now * 4 + t.idx * 1.7) * 0.6)
+                t.k, t.d = 110, 8
+            else
+                if not t.planted then t.planted = ground end
+                t.k, t.d = 190, 12
+                local leadPos = ground + lead
+                local dv = leadPos - t.planted
+                dv = dv - up * dv:Dot(up) * 0.4
+                t.need = dv.Magnitude / thr
+                t.over = (anchorW - t.planted).Magnitude > LENGTH * 0.95
+
+                if t.stepping then
+                    t.stepT = t.stepT + dt / t.dur
+                    local kk = math.min(t.stepT, 1)
+                    local e = kk * kk * (3 - 2 * kk)
+                    t.target = t.stepFrom:Lerp(leadPos, e) + up * (math.sin(math.pi * kk) * t.arcH)
+                    if t.stepT >= 1 then
+                        t.stepping = false
+                        t.planted = leadPos
+                        t.target = leadPos
+                        -- ТЯЖЁЛЫЙ ШАГ: звук в точке касания (не чаще чем раз в 30 мс на лапу)
+                        if now - t.lastPlant > 0.03 then
+                            t.lastPlant = now
+                            t.emitter.Position = leadPos
+                            SFX.plant(t, crawl)
+                        end
+                    else
+                        busy[slot.group] = true
+                    end
+                else
+                    t.target = t.planted
+                end
+                if t.ext > 0.6 then anyPlanted = true end
+            end
+        end
+    end
+    c.anyPlanted = anyPlanted
+
+    -- тело поднялось / опустилось (гидравлика)
+    if anyPlanted ~= c.wasPlanted then
+        c.wasPlanted = anyPlanted
+        if anyPlanted then SFX.liftUp() else SFX.liftDown() end
+    end
+
+    -- ── решаем, какая диагональная пара шагает (походка «трот») ──
+    if not busy[1] and not busy[2] then
+        local best, bestNeed = nil, 1
+        for g = 1, 2 do
+            local need = 0
+            for _, t in ipairs(tentacles) do
+                if t.active and not t.raise and t.slot.group == g and t.need > need then need = t.need end
+            end
+            if need > bestNeed then best, bestNeed = g, need end
+        end
+        if best then
+            for _, t in ipairs(tentacles) do
+                if t.active and not t.raise and t.slot.group == best and not t.stepping and t.need > 0.45 then
+                    startStep(t, stepDur)
+                end
+            end
+        end
+    end
+    for _, t in ipairs(tentacles) do
+        if t.active and not t.raise and not t.stepping and (t.need > 1.9 or t.over) then
+            startStep(t, stepDur)
+        end
+    end
+
+    -- ── проход 2: пружина кончика + отрисовка ──
+    for _, t in ipairs(tentacles) do
+        if t.active then
+            t.tip, t.tipV = spring(t.tip, t.tipV, t.target, t.k, t.d, dt)
+            if not t.raise and t.planted and not t.stepping then
+                local h = (t.tip - t.planted):Dot(up)
+                if h < 0 then
+                    t.tip = t.tip - up * h
+                    local vn = t.tipV:Dot(up)
+                    if vn < 0 then
+                        t.tipV = t.tipV - up * vn * (1 + (vn < -4 and 0.3 or 0))
+                    end
+                end
+            end
+
+            -- удар лапой после выдвижения: звук, когда кончик долетел до земли
+            if t.slamAt then
+                if t.planted and (t.tip - t.planted):Dot(up) < 1.0 then
+                    t.slamAt = nil
+                    t.emitter.Position = t.planted
+                    SFX.slam(t)
+                elseif now - t.slamAt > 0.9 then
+                    t.slamAt = nil
+                end
+            end
+
+            -- клешня: в воздухе сложена, на земле растопырена (пружинит с «цапом»)
+            local gt = t.raise and 0.55 or (t.stepping and 0.1 or 1)
+            t.grip, t.gripV = spring(t.grip, t.gripV, gt, 170, 11, dt)
+
+            t.emitter.Position = t.tip
+            drawTentacle(t, t.anchorW, t.tip, up, right, now, bodySpeed, dt)
+        end
+    end
+    updateHarness(c, maxExt, now)
+
+    -- серво-трещотка из «рюкзака»: чем быстрее идёшь — тем чаще и выше щёлкает
+    if on and anyPlanted and bodySpeed > 2 and now >= audio.servoAt then
+        local s = audio.s
+        audio.servoAt = now + lerp(0.16, 0.05, s) * rnd(0.8, 1.2)
+        play("tick", { em = emitters[0], pitch = jit(lerp(1.0, 2.2, s), 0.1), vol = lerp(0.35, 0.55, s) })
+    end
+end
+
+local lastErr = nil
+RunService:BindToRenderStep("OctoArms", Enum.RenderPriority.Camera.Value - 1, function(dt)
+    local ok, err = pcall(update, dt)
+    if not ok and err ~= lastErr then
+        lastErr = err
+        warn("[OctoArms] " .. tostring(err))
+    end
+end)
+
+-- ══════════════════════════ МЕНЮ ══════════════════════════════════════════
+local gui
+local cleanup
+
+do
+    local BG     = Color3.fromRGB(11, 14, 14)
+    local ROW    = Color3.fromRGB(21, 27, 26)
+    local OFF    = Color3.fromRGB(50, 60, 58)
+    local TXT    = Color3.fromRGB(226, 240, 232)
+    local MUTED  = Color3.fromRGB(128, 148, 140)
+    local VIOLET = Color3.fromRGB(70, 200, 255)
+
+    gui = Instance.new("ScreenGui")
+    gui.Name = "OctoArmsUI"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 999
+    local parented = pcall(function()
+        gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+    end)
+    if not parented or not gui.Parent then
+        gui.Parent = LP:WaitForChild("PlayerGui")
+    end
+
+    local function make(class, props, parent)
+        local o = Instance.new(class)
+        for k, v in pairs(props) do o[k] = v end
+        o.Parent = parent
+        return o
+    end
+    local function corner(o, r) return make("UICorner", { CornerRadius = UDim.new(0, r) }, o) end
+
+    local W, HEADER, FULL_H = 176, 30, 256
+    local CW = 132
+
+    local root = make("Frame", {
+        Name = "Root", Size = UDim2.fromOffset(W, FULL_H), Position = UDim2.fromOffset(12, 70),
+        BackgroundColor3 = BG, BackgroundTransparency = 0.04, BorderSizePixel = 0, ClipsDescendants = true,
+    }, gui)
+    corner(root, 10)
+    local stroke = make("UIStroke", { Color = ACCENT, Thickness = 1, Transparency = 0.35 }, root)
+    make("UIGradient", {
+        Color = ColorSequence.new(ACCENT, VIOLET), Rotation = 45,
+    }, stroke)
+
+    local header = make("Frame", {
+        Name = "Header", Size = UDim2.new(1, 0, 0, HEADER), BackgroundTransparency = 1,
+    }, root)
+    local dot = make("Frame", {
+        Size = UDim2.fromOffset(8, 8), Position = UDim2.fromOffset(11, 11), BackgroundColor3 = OFF, BorderSizePixel = 0,
+    }, header)
+    corner(dot, 4)
+    make("TextLabel", {
+        Text = "OCTO ARMS", Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = TXT,
+        TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(26, 0), Size = UDim2.new(1, -80, 1, 0),
+    }, header)
+
+    local function hbtn(text, xOff)
+        local b = make("TextButton", {
+            Text = text, Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = MUTED, AutoButtonColor = false,
+            BackgroundColor3 = ROW, Size = UDim2.fromOffset(20, 20), AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, xOff, 0.5, 0), BorderSizePixel = 0,
+        }, header)
+        corner(b, 6)
+        return b
+    end
+    local closeBtn = hbtn("×", -7)
+    local foldBtn  = hbtn("–", -31)
+
+    local body = make("Frame", {
+        Name = "Body", Position = UDim2.fromOffset(0, HEADER), Size = UDim2.new(1, 0, 1, -HEADER),
+        BackgroundTransparency = 1,
+    }, root)
+    make("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, 2) }, body)
+    make("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, body)
+
+    local function row(h, order)
+        local r = make("Frame", {
+            Size = UDim2.new(1, 0, 0, h), BackgroundColor3 = ROW, BorderSizePixel = 0, LayoutOrder = order,
+        }, body)
+        corner(r, 7)
+        return r
+    end
+
+    local function label(parent, text, size)
+        return make("TextLabel", {
+            Text = text, Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = TXT,
+            TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(10, 0), Size = size or UDim2.new(1, -56, 0, 26),
+        }, parent)
+    end
+
+    local function makeToggle(text, order, cb)
+        local r = row(26, order)
+        label(r, text)
+        local track_ = make("Frame", {
+            Size = UDim2.fromOffset(32, 16), AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0),
+            BackgroundColor3 = OFF, BorderSizePixel = 0,
+        }, r)
+        corner(track_, 8)
+        local knob = make("Frame", {
+            Size = UDim2.fromOffset(12, 12), AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 2, 0.5, 0),
+            BackgroundColor3 = WHITE, BorderSizePixel = 0,
+        }, track_)
+        corner(knob, 6)
+        local click = make("TextButton", { Text = "", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1) }, r)
+        local state = false
+        local obj = {}
+        function obj.set(v, silent)
+            state = v
+            TweenService:Create(track_, TweenInfo.new(0.18, Enum.EasingStyle.Quad), {
+                BackgroundColor3 = v and ACCENT or OFF,
+            }):Play()
+            TweenService:Create(knob, TweenInfo.new(0.2, Enum.EasingStyle.Back), {
+                Position = v and UDim2.new(0, 18, 0.5, 0) or UDim2.new(0, 2, 0.5, 0),
+            }):Play()
+            if not silent then cb(v) end
+        end
+        track(click.Activated:Connect(function() obj.set(not state) end))
+        return obj
+    end
+
+    local tentToggle, crawlToggle
+
+    local function setEnabled(v)
+        CFG.enabled = v
+        TweenService:Create(dot, TweenInfo.new(0.2), { BackgroundColor3 = v and ACCENT or OFF }):Play()
+        if not v and CFG.crawl then
+            CFG.crawl = false
+            crawlToggle.set(false, true)
+        end
+    end
+    tentToggle = makeToggle("Щупальца", 1, setEnabled)
+    crawlToggle = makeToggle("Ползание", 2, function(v)
+        CFG.crawl = v
+        if v and not CFG.enabled then
+            tentToggle.set(true) -- ползание работает на щупальцах — включаем их
+        end
+    end)
+    local soundToggle = makeToggle("Звук", 3, function(v) CFG.sound = v end)
+    soundToggle.set(CFG.sound, true)
+
+    -- количество щупалец
+    do
+        local r = row(26, 4)
+        label(r, "Кол-во")
+        local function sbtn(text, x)
+            local b = make("TextButton", {
+                Text = text, Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = TXT, AutoButtonColor = false,
+                BackgroundColor3 = Color3.fromRGB(36, 46, 44), Size = UDim2.fromOffset(22, 20),
+                AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, x, 0.5, 0), BorderSizePixel = 0,
+            }, r)
+            corner(b, 6)
+            return b
+        end
+        local plus, minus = sbtn("+", -6), sbtn("–", -52)
+        local num = make("TextLabel", {
+            Text = tostring(CFG.count), Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = ACCENT,
+            BackgroundTransparency = 1, Size = UDim2.fromOffset(20, 20), AnchorPoint = Vector2.new(1, 0.5),
+            Position = UDim2.new(1, -30, 0.5, 0),
+        }, r)
+        local function setCount(n)
+            CFG.count = math.clamp(n, 1, 4)
+            num.Text = tostring(CFG.count)
+        end
+        track(plus.Activated:Connect(function() setCount(CFG.count + 1) end))
+        track(minus.Activated:Connect(function() setCount(CFG.count - 1) end))
+    end
+
+    -- универсальный ползунок
+    local activeSlide, slideInput = nil, nil
+    local function makeSlider(order, title, vmin, vmax, fmt, init, cb)
+        local r = row(40, order)
+        label(r, title, UDim2.new(1, -60, 0, 24))
+        local val = make("TextLabel", {
+            Text = "", Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = ACCENT, BackgroundTransparency = 1,
+            TextXAlignment = Enum.TextXAlignment.Right, Position = UDim2.new(1, -50, 0, 0), Size = UDim2.fromOffset(42, 24),
+        }, r)
+        local tr = make("Frame", {
+            Position = UDim2.new(0, 10, 0, 29), Size = UDim2.new(1, -20, 0, 5), BackgroundColor3 = OFF, BorderSizePixel = 0,
+        }, r)
+        corner(tr, 3)
+        local fill = make("Frame", { Size = UDim2.fromScale(0, 1), BackgroundColor3 = ACCENT, BorderSizePixel = 0 }, tr)
+        corner(fill, 3)
+        make("UIGradient", { Color = ColorSequence.new(ACCENT, VIOLET) }, fill)
+        local knob = make("Frame", {
+            Size = UDim2.fromOffset(12, 12), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0, 0.5),
+            BackgroundColor3 = WHITE, BorderSizePixel = 0, ZIndex = 3,
+        }, tr)
+        corner(knob, 6)
+        local hit = make("TextButton", {
+            Text = "", BackgroundTransparency = 1, Position = UDim2.new(0, 4, 0, 18), Size = UDim2.new(1, -8, 0, 22),
+        }, r)
+
+        local function setV(v)
+            v = math.clamp(v, vmin, vmax)
+            local a = (v - vmin) / (vmax - vmin)
+            fill.Size = UDim2.fromScale(a, 1)
+            knob.Position = UDim2.fromScale(a, 0.5)
+            val.Text = string.format(fmt, v)
+            cb(v)
+        end
+        local function fromX(x)
+            local a = math.clamp((x - tr.AbsolutePosition.X) / math.max(tr.AbsoluteSize.X, 1), 0, 1)
+            setV(math.floor((vmin + a * (vmax - vmin)) * 10 + 0.5) / 10)
+        end
+        track(hit.InputBegan:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+                activeSlide, slideInput = fromX, i
+                fromX(i.Position.X)
+            end
+        end))
+        setV(init)
+        return setV
+    end
+
+    makeSlider(5, "Скорость", SPEED_MIN, SPEED_MAX, "x%.1f", CFG.speed, function(v) CFG.speed = v end)
+    makeSlider(6, "Громкость", 0, 2, "%.1f", CFG.volume, function(v)
+        CFG.volume = v
+        pcall(function() sfxGroup.Volume = v end)
+    end)
+
+    -- перетаскивание меню за шапку
+    local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
+    track(header.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragInput, dragStart, startPos = true, i, i.Position, root.Position
+        end
+    end))
+    track(UserInputService.InputChanged:Connect(function(i)
+        if activeSlide and (i == slideInput or i.UserInputType == Enum.UserInputType.MouseMovement) then
+            activeSlide(i.Position.X)
+        end
+        if dragging and (i == dragInput or i.UserInputType == Enum.UserInputType.MouseMovement) then
+            local d = i.Position - dragStart
+            root.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end))
+    track(UserInputService.InputEnded:Connect(function(i)
+        if i == slideInput or i.UserInputType == Enum.UserInputType.MouseButton1 then activeSlide = nil end
+        if i == dragInput or i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+    end))
+
+    -- сворачивание меню (плавно «заворачивается» в маленькую плашку)
+    local expanded = true
+    local foldToken = 0
+    track(foldBtn.Activated:Connect(function()
+        expanded = not expanded
+        foldToken = foldToken + 1
+        local token = foldToken
+        if expanded then body.Visible = true end
+        TweenService:Create(root, TweenInfo.new(0.32, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
+            Size = expanded and UDim2.fromOffset(W, FULL_H) or UDim2.fromOffset(CW, HEADER),
+        }):Play()
+        foldBtn.Text = expanded and "–" or "+"
+        if not expanded then
+            task.delay(0.3, function()
+                if foldToken == token then body.Visible = false end
+            end)
+        end
+    end))
+
+    track(closeBtn.Activated:Connect(function() cleanup() end))
+end
+
+-- ══════════════════════════ ЗАВЕРШЕНИЕ ════════════════════════════════════
+cleanup = function()
+    audio.dead = true
+    for _, cn in ipairs(connections) do pcall(function() cn:Disconnect() end) end
+    pcall(function() RunService:UnbindFromRenderStep("OctoArms") end)
+    pcall(function()
+        local c = ctx
+        if c then
+            if c.crawling then c.hum.PlatformStand = false end
+            c.hum.HipHeight = c.origHip
+            if c.on then c.hum.WalkSpeed = c.baseSpeed end
+            if c.animate then c.animate.Disabled = false end
+            for _, e in ipairs(c.motors) do e.m.C0 = e.c0 end
+        end
+    end)
+    -- звуки
+    for v in pairs(active) do pcall(function() v.snd:Stop() end) end
+    for _, P in pairs(pools) do
+        for _, v in ipairs(P.v) do pcall(function() v.snd:Destroy() end) end
+    end
+    pcall(function() sfxGroup:Destroy() end)
+    -- портал и щупальца
+    for _, part in ipairs({ rig.plate, rig.ring, rig.core }) do pcall(function() part:Destroy() end) end
+    for _, dpart in ipairs(rig.dots) do pcall(function() dpart:Destroy() end) end
+    pcall(function() container:Destroy() end)
+    pcall(function() gui:Destroy() end)
+    genv.__OCTOARMS_CLEANUP = nil
+end
+genv.__OCTOARMS_CLEANUP = cleanup
