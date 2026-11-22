@@ -1,12 +1,14 @@
---[[
+﻿--[[
     PROJECT PHOENIX  |  Колба клонирования (Rick & Morty style)
     Для Roblox Delta (клиентский скрипт, всё видно только тебе)
 
-    1) Поставить колбу  -> внутри висит твой голый клон
+
+    1) Поставить колбу  -> внутри на корточках висит твой голый клон
     2) Умираешь         -> просыпаешься голым в колбе
     3) Колба открывается, вода выливается
     4) Выходишь из колбы -> щупальца достают твою одежду, одевают и складываются
 ]]
+
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -16,9 +18,11 @@ local Debris = game:GetService("Debris")
 local UIS = game:GetService("UserInputService")
 local LP = Players.LocalPlayer
 
+
 if getgenv and getgenv().__PHOENIX_CLEANUP then
     pcall(getgenv().__PHOENIX_CLEANUP)
 end
+
 
 ---------------------------------------------------------------------
 -- КОНСТАНТЫ
@@ -28,12 +32,14 @@ local GREEN = Color3.fromRGB(90, 255, 170)
 local AMBER = Color3.fromRGB(255, 170, 40)
 local WATER = Color3.fromRGB(110, 255, 190)
 local METAL = Color3.fromRGB(34, 38, 44)
+local STEEL = Color3.fromRGB(118, 128, 140)
 local GLASS_H, GLASS_Y = 11, 6.7
-local CAP_Y = 12.9
 local LIQ_B, LIQ_H, LIQ_D = 1.21, 10.4, 6.9
 local FLOOR_TOP = 1.45
+local CAP_RISE = 4.0
 local ROT = CFrame.Angles(0, 0, math.rad(90)) -- цилиндр стоймя
 local SEG = 10 -- сегментов в щупальце
+
 
 local P = nil          -- текущая колба
 local session = 0      -- токен: при смерти/удалении старые анимации обрываются
@@ -41,6 +47,7 @@ local outfit = { shirt = {}, pants = {}, accs = {} }
 local uiConns = {}
 local gui, overlay, overlayText, toast, statusLbl
 local blur, cc
+
 
 ---------------------------------------------------------------------
 -- УТИЛИТЫ
@@ -52,6 +59,7 @@ local function ease(a)
     return 1 - ((-2 * a + 2) ^ 2) / 2
 end
 
+
 local function animate(dur, fn, my)
     local t0 = os.clock()
     while true do
@@ -62,6 +70,7 @@ local function animate(dur, fn, my)
         RunService.Heartbeat:Wait()
     end
 end
+
 
 local function mk(parent, props)
     local p = Instance.new("Part")
@@ -77,6 +86,7 @@ local function mk(parent, props)
     return p
 end
 
+
 local toastId = 0
 local function notify(text, dur)
     if not toast then return end
@@ -89,6 +99,7 @@ local function notify(text, dur)
     end)
 end
 
+
 local function setOverlay(alpha, text)
     if not overlay then return end
     overlay.BackgroundTransparency = alpha
@@ -96,6 +107,7 @@ local function setOverlay(alpha, text)
     overlayText.TextTransparency = alpha
     if text then overlayText.Text = text end
 end
+
 
 local function endFx()
     if blur then blur:Destroy() blur = nil end
@@ -112,10 +124,67 @@ local function startFx()
     cc.Parent = Lighting
 end
 
+
 local function standOffset(hum, hrp)
     if hum.RigType == Enum.HumanoidRigType.R6 then return 3 end
     return hum.HipHeight + hrp.Size.Y / 2
 end
+
+
+---------------------------------------------------------------------
+-- ПОЗА «НА КОРТОЧКАХ» (через C0 суставов Motor6D)
+---------------------------------------------------------------------
+local R15_CROUCH = {
+    Waist = { -0.55, 0, 0 },
+    Neck = { -0.25, 0, 0 },
+    LeftHip = { 1.7, 0, -0.12 },   RightHip = { 1.7, 0, 0.12 },
+    LeftKnee = { -2.5, 0, 0 },     RightKnee = { -2.5, 0, 0 },
+    LeftAnkle = { 0.4, 0, 0 },     RightAnkle = { 0.4, 0, 0 },
+    LeftShoulder = { 1.15, 0, 0.2 }, RightShoulder = { 1.15, 0, -0.2 },
+    LeftElbow = { 0.8, 0, 0 },     RightElbow = { 0.8, 0, 0 },
+}
+local R6_CROUCH = {
+    Neck = { -0.3, 0, 0 },
+    ["Left Hip"] = { 1.5, 0, -0.1 },   ["Right Hip"] = { 1.5, 0, 0.1 },
+    ["Left Shoulder"] = { 1.2, 0, 0.2 }, ["Right Shoulder"] = { 1.2, 0, -0.2 },
+}
+
+
+local function buildRig(model)
+    local rig = {}
+    local tbl = model:FindFirstChild("UpperTorso") and R15_CROUCH or R6_CROUCH
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("Motor6D") and tbl[d.Name] then
+            table.insert(rig, { j = d, c0 = d.C0, a = tbl[d.Name] })
+        end
+    end
+    return rig
+end
+
+
+local function applyRig(rig, c)
+    for _, r in ipairs(rig) do
+        if r.j.Parent then
+            r.j.C0 = CFrame.new(r.c0.Position) * CFrame.Angles(r.a[1] * c, r.a[2] * c, r.a[3] * c) * r.c0.Rotation
+        end
+    end
+end
+
+
+local function releaseRig(pod)
+    if pod.rig then pcall(applyRig, pod.rig, 0) pod.rig = nil end
+    if pod.animScript and pod.animScript.Parent then pod.animScript.Disabled = false end
+    pod.animScript = nil
+end
+
+
+local function stopAnims(hum)
+    local animator = hum:FindFirstChildOfClass("Animator")
+    if animator then
+        for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do tr:Stop(0) end
+    end
+end
+
 
 ---------------------------------------------------------------------
 -- ОДЕЖДА (снимаем локально, потом надеваем щупальцами)
@@ -133,6 +202,7 @@ local function stripOutfit(char)
     end
 end
 
+
 local function wear(list, char, hum)
     for _, i in ipairs(list) do
         if i:IsA("Accessory") then
@@ -145,6 +215,7 @@ local function wear(list, char, hum)
     table.clear(list)
 end
 
+
 local function wearAll(char)
     if not char or outfit.owner ~= char then return end
     local hum = char:FindFirstChildOfClass("Humanoid")
@@ -154,11 +225,13 @@ local function wearAll(char)
     wear(outfit.accs, char, hum)
 end
 
+
 ---------------------------------------------------------------------
--- КЛОН (голая копия персонажа)
+-- КЛОН (голая копия персонажа, в позе на корточках)
 ---------------------------------------------------------------------
 local function makeClone(pod, char)
     if pod.clone then pod.clone:Destroy() pod.clone = nil end
+    pod.cloneRig = nil
     local ok, c = pcall(function()
         char.Archivable = true
         return char:Clone()
@@ -173,22 +246,23 @@ local function makeClone(pod, char)
         end
     end
     for _, d in ipairs(kill) do pcall(function() d:Destroy() end) end
+    local h = c:FindFirstChildOfClass("Humanoid")
+    if h then h:Destroy() end
+    -- якорим только корень: остальные части идут за суставами (иначе поза не работает)
     for _, d in ipairs(c:GetDescendants()) do
         if d:IsA("BasePart") then
-            d.Anchored = true; d.CanCollide = false; d.CanQuery = false; d.CanTouch = false
+            d.Anchored = false; d.CanCollide = false; d.CanQuery = false; d.CanTouch = false; d.Massless = true
         end
     end
-    local h = c:FindFirstChildOfClass("Humanoid")
-    if h then
-        h.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
-        h.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
-        h.PlatformStand = true
-    end
+    local root = c:FindFirstChild("HumanoidRootPart")
+    if root then root.Anchored = true end
     c.Name = "PhoenixClone"
-    if not c.PrimaryPart then c.PrimaryPart = c:FindFirstChild("HumanoidRootPart") end
+    c.PrimaryPart = root
     c.Parent = pod.model
     pod.clone = c
+    pod.cloneRig = buildRig(c)
 end
+
 
 ---------------------------------------------------------------------
 -- ЩУПАЛЬЦА (сегментный манипулятор по кривой Безье)
@@ -220,6 +294,7 @@ local function buildArm(model, basePos)
     end
     return A
 end
+
 
 local function updateArm(A, t, model)
     local e = A.e
@@ -263,83 +338,243 @@ local function updateArm(A, t, model)
     A.fingers[2].CFrame = CFrame.new(tip - rot.RightVector * 0.55 + Vector3.new(0, -0.35, 0)) * rot
 end
 
+
 ---------------------------------------------------------------------
--- СБОРКА КОЛБЫ
+-- СБОРКА КОЛБЫ (детальная модель)
 ---------------------------------------------------------------------
 local function buildPod(cf, char, hum, hrp)
     local model = Instance.new("Model")
     model.Name = "PhoenixPod"
     model.Parent = workspace
 
-    local pod = { cf = cf, model = model, arms = {}, fadeId = 0 }
-    local off = standOffset(hum, hrp)
-    pod.standY = FLOOR_TOP + off
-    pod.floatY = pod.standY + 1.5
 
-    local function put(p, y, x, z)
-        p.CFrame = cf * CFrame.new(x or 0, y, z or 0) * ROT
+    local pod = { cf = cf, model = model, arms = {}, fadeId = 0 }
+    pod.standY = FLOOR_TOP + standOffset(hum, hrp)
+    pod.floatY = pod.standY + 1.7
+
+
+    local neons = {}
+    local glassG, capG = {}, {}
+    pod.glassG, pod.capG = glassG, capG
+
+
+    ----- помощники построения -----
+    local function put(p, y, x, z) p.CFrame = cf * CFrame.new(x or 0, y, z or 0) * ROT end
+    local function reg(p, rel, group)
+        p.CFrame = cf * rel
+        if group then table.insert(group, { p, rel }) end
+        return p
     end
-    local function cylP(d, h, y, props, x, z)
+    local function steel(t)
+        local o = { Color = METAL, Material = Enum.Material.Metal }
+        for k, v in pairs(t or {}) do o[k] = v end
+        return o
+    end
+    local function solid(t)
+        local o = steel(t); o.CanCollide = true; o.CanQuery = true
+        return o
+    end
+    local function cylP(d, h, y, props, x, z, group)
         props = props or {}
         props.Shape = Enum.PartType.Cylinder
         props.Size = Vector3.new(h, d, d)
-        local p = mk(model, props)
-        put(p, y, x, z)
-        return p
+        return reg(mk(model, props), CFrame.new(x or 0, y, z or 0) * ROT, group)
     end
-    pod.put, pod.cylP = put, cylP
-
-    local neons = {}
-    local function neonCyl(d, h, y, x, z)
-        local p = cylP(d, h, y, { Color = GREEN, Material = Enum.Material.Neon }, x, z)
+    local function blk(size, rel, props, group)
+        props = props or {}
+        props.Size = size
+        return reg(mk(model, props), rel, group)
+    end
+    local function neonCyl(d, h, y, x, z, group)
+        local p = cylP(d, h, y, { Color = GREEN, Material = Enum.Material.Neon }, x, z, group)
         table.insert(neons, p)
         return p
     end
+    local function neonBlk(size, rel, group)
+        local p = blk(size, rel, { Color = GREEN, Material = Enum.Material.Neon }, group)
+        table.insert(neons, p)
+        return p
+    end
+    local function dome(sx, sy, sz, y, props, group)
+        props.Size = Vector3.new(sx, sy, sz)
+        local p = mk(model, props)
+        local m = Instance.new("SpecialMesh")
+        m.MeshType = Enum.MeshType.Sphere
+        m.Parent = p
+        return reg(p, CFrame.new(0, y, 0), group)
+    end
+    -- кольцо из блоков (получается «полая» труба/пояс)
+    local function ring(radius, n, radial, height, y, props, group, isNeon)
+        local tang = 2 * math.pi * radius / n * 1.1
+        for i = 1, n do
+            local a = (i / n) * math.pi * 2
+            local rel = CFrame.new(math.cos(a) * radius, y, math.sin(a) * radius) * CFrame.Angles(0, -a, 0)
+            local pr = {}
+            for k, v in pairs(props) do pr[k] = v end
+            local p = blk(Vector3.new(radial, height, tang), rel, pr, group)
+            if isNeon then table.insert(neons, p) end
+        end
+    end
+    -- провисающий кабель (координаты относительно колбы)
+    local function cable(a, b, sag, th, col, material)
+        local n = 12
+        local prev
+        for i = 0, n do
+            local s = i / n
+            local p = a:Lerp(b, s) - Vector3.new(0, math.sin(s * math.pi) * sag, 0)
+            if prev then
+                local wa, wb = cf:PointToWorldSpace(prev), cf:PointToWorldSpace(p)
+                local len = (wb - wa).Magnitude
+                local seg = mk(model, {
+                    Shape = Enum.PartType.Cylinder, Size = Vector3.new(len + 0.04, th, th),
+                    Color = col, Material = material or Enum.Material.SmoothPlastic,
+                })
+                seg.CFrame = CFrame.lookAt((wa + wb) / 2, wb) * CFrame.Angles(0, math.pi / 2, 0)
+            end
+            prev = p
+        end
+    end
+    pod.put, pod.cylP = put, cylP
 
-    -- база и пол
-    cylP(10, 1.2, 0.6, { Color = METAL, Material = Enum.Material.Metal, CanCollide = true, CanQuery = true })
-    neonCyl(10.12, 0.14, 0.35)
-    neonCyl(10.12, 0.14, 1.0)
-    cylP(6.6, 0.25, 1.325, { Color = Color3.fromRGB(55, 60, 68), Material = Enum.Material.DiamondPlate, CanCollide = true, CanQuery = true })
-    neonCyl(5.2, 0.04, 1.46)
 
-    -- стекло, жидкость, крышка
-    pod.glass = cylP(7.2, GLASS_H, GLASS_Y, { Color = Color3.fromRGB(200, 235, 255), Transparency = 0.78, Material = Enum.Material.Glass, Reflectance = 0.08 })
+    ----- БАЗА: ступенчатые ярусы -----
+    cylP(11.4, 0.45, 0.225, solid({ Color = Color3.fromRGB(24, 27, 32) }))
+    cylP(10.8, 0.36, 0.63, solid())
+    neonCyl(10.9, 0.08, 0.84)
+    cylP(10.2, 0.36, 1.02, solid({ Color = Color3.fromRGB(44, 50, 57) }))
+    -- пол внутри колбы
+    cylP(6.6, 0.25, 1.325, solid({ Color = Color3.fromRGB(55, 60, 68), Material = Enum.Material.DiamondPlate }))
+    ring(2.9, 24, 0.22, 0.04, 1.47, { Color = GREEN, Material = Enum.Material.Neon }, nil, true)
+    ring(1.5, 14, 0.22, 0.04, 1.47, { Color = GREEN, Material = Enum.Material.Neon }, nil, true)
+    -- воротник у основания стекла
+    ring(3.78, 20, 0.36, 0.7, 1.55, steel({ Color = Color3.fromRGB(72, 80, 90) }))
+    ring(3.78, 20, 0.2, 0.05, 1.92, { Color = GREEN, Material = Enum.Material.Neon }, nil, true)
+
+
+    -- рельсы-направляющие для крышки
+    local rails = { Vector3.new(-3.25, 0, 3.25), Vector3.new(3.25, 0, 3.25), Vector3.new(0, 0, 4.6) }
+    for _, r in ipairs(rails) do
+        cylP(1.2, 0.4, 1.4, steel({ Color = Color3.fromRGB(60, 66, 74) }), r.X, r.Z)
+        cylP(0.55, 20, 11.2, steel({ Color = STEEL }), r.X, r.Z)
+        local ball = mk(model, { Shape = Enum.PartType.Ball, Size = Vector3.new(0.85, 0.85, 0.85), Color = STEEL, Material = Enum.Material.Metal })
+        ball.CFrame = cf * CFrame.new(r.X, 21.2, r.Z)
+        for _, ry in ipairs({ 2.6, 6.0, 9.4, 17.5 }) do
+            neonCyl(0.8, 0.1, ry, r.X, r.Z)
+        end
+    end
+
+
+    -- болты по краю верхнего яруса
+    local avoid = { Vector3.new(-3.5, 0, -2.5), Vector3.new(3.5, 0, -2.5), Vector3.new(0, 0, -4.3) }
+    for _, r in ipairs(rails) do table.insert(avoid, r) end
+    for i = 1, 28 do
+        local a = (i / 28) * math.pi * 2
+        local bx, bz = math.cos(a) * 4.95, math.sin(a) * 4.95
+        local ok = true
+        for _, v in ipairs(avoid) do
+            if (Vector3.new(bx, 0, bz) - v).Magnitude < 1.15 then ok = false break end
+        end
+        if ok then
+            if i % 4 == 0 then
+                neonCyl(0.34, 0.1, 1.24, bx, bz)
+            else
+                cylP(0.3, 0.1, 1.24, steel({ Color = Color3.fromRGB(150, 158, 168) }), bx, bz)
+            end
+        end
+    end
+
+
+    -- панели на боку базы
+    for i = 1, 8 do
+        local a = (i / 8) * math.pi * 2 + math.pi / 8
+        if math.sin(a) > -0.97 then
+            local rel = CFrame.new(math.cos(a) * 5.38, 0.63, math.sin(a) * 5.38) * CFrame.Angles(0, -a, 0)
+            blk(Vector3.new(0.12, 0.22, 1.2), rel, steel({ Color = Color3.fromRGB(14, 16, 19) }))
+            local rel2 = CFrame.new(math.cos(a) * 5.45, 0.63, math.sin(a) * 5.45) * CFrame.Angles(0, -a, 0)
+            neonBlk(Vector3.new(0.05, 0.07, 0.8), rel2)
+        end
+    end
+
+
+    -- табличка спереди
+    local sign = blk(Vector3.new(3.2, 0.34, 0.1), CFrame.new(0, 1.02, -5.12), steel({ Color = Color3.fromRGB(10, 14, 12) }))
+    local sgn = Instance.new("SurfaceGui")
+    sgn.Face = Enum.NormalId.Front
+    sgn.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+    sgn.PixelsPerStud = 120
+    sgn.LightInfluence = 0
+    sgn.Parent = sign
+    local sl = Instance.new("TextLabel")
+    sl.Size = UDim2.fromScale(1, 1)
+    sl.BackgroundTransparency = 1
+    sl.Text = "PHOENIX PROJECT"
+    sl.TextColor3 = GREEN
+    sl.Font = Enum.Font.GothamBlack
+    sl.TextScaled = true
+    sl.Parent = sgn
+
+
+    -- ступенька
+    blk(Vector3.new(4.2, 0.6, 1.4), CFrame.new(0, 0.3, -6.1), solid())
+    neonBlk(Vector3.new(4.0, 0.05, 0.12), CFrame.new(0, 0.62, -5.55))
+
+
+    ----- СТЕКЛО (группа, уходит вниз) -----
+    cylP(7.2, GLASS_H, GLASS_Y, { Color = Color3.fromRGB(200, 235, 255), Transparency = 0.78, Material = Enum.Material.Glass, Reflectance = 0.08 }, 0, 0, glassG)
+    for _, a in ipairs({ math.rad(235), math.rad(300) }) do
+        local rel = CFrame.new(math.cos(a) * 3.63, 6.7, math.sin(a) * 3.63) * CFrame.Angles(0, -a, 0)
+        blk(Vector3.new(0.05, 9.4, 0.28), rel, { Color = Color3.new(1, 1, 1), Transparency = 0.55, Material = Enum.Material.Glass }, glassG)
+    end
+    ring(3.7, 18, 0.16, 0.24, 4.2, steel({ Color = Color3.fromRGB(60, 66, 74) }), glassG)
+    ring(3.7, 18, 0.16, 0.24, 9.2, steel({ Color = Color3.fromRGB(60, 66, 74) }), glassG)
+    ring(3.7, 18, 0.2, 0.05, 4.2, { Color = GREEN, Material = Enum.Material.Neon }, glassG, true)
+
+
+    ----- ЖИДКОСТЬ -----
     pod.liquid = cylP(LIQ_D, LIQ_H, LIQ_B + LIQ_H / 2, { Color = WATER, Transparency = 0.55 })
-    pod.cap = cylP(8.2, 1.4, CAP_Y, { Color = METAL, Material = Enum.Material.Metal })
-    pod.capRing = neonCyl(8.3, 0.14, CAP_Y - 0.5)
-
     local light = Instance.new("PointLight")
     light.Color = WATER; light.Range = 18; light.Brightness = 1.4
     light.Parent = pod.liquid
     pod.light = light
 
-    -- трубы
-    for _, v in ipairs({ Vector3.new(-3.3, 0, 3.3), Vector3.new(3.3, 0, 3.3), Vector3.new(0, 0, 4.6) }) do
-        local p = mk(model, {
-            Shape = Enum.PartType.Cylinder, Size = Vector3.new(12.6, 0.6, 0.6),
-            Color = Color3.fromRGB(70, 76, 84), Material = Enum.Material.Metal,
-        })
-        p.CFrame = cf * CFrame.new(v.X, 6.3, v.Z) * ROT
-        for k = 1, 3 do
-            local r = mk(model, {
-                Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.25, 0.85, 0.85),
-                Color = GREEN, Material = Enum.Material.Neon,
-            })
-            r.CFrame = cf * CFrame.new(v.X, 2 + k * 3.2, v.Z) * ROT
-            table.insert(neons, r)
-        end
+
+    ----- КРЫШКА С КУПОЛОМ (группа, поднимается по рельсам) -----
+    cylP(8.0, 0.45, 12.425, steel({ Color = Color3.fromRGB(46, 52, 60) }), 0, 0, capG)
+    neonCyl(8.12, 0.1, 12.55, 0, 0, capG)
+    cylP(7.4, 0.6, 12.95, steel({ Color = Color3.fromRGB(58, 65, 74) }), 0, 0, capG)
+    cylP(6.2, 0.5, 13.5, steel({ Color = Color3.fromRGB(80, 88, 98) }), 0, 0, capG)
+    ring(3.7, 8, 0.5, 0.9, 12.95, steel({ Color = Color3.fromRGB(30, 34, 40) }), capG)
+    dome(5.2, 1.9, 5.2, 13.9, steel({ Color = Color3.fromRGB(96, 106, 118) }), capG)
+    cylP(1.4, 1.0, 15.2, steel({ Color = Color3.fromRGB(46, 52, 60) }), 0, 0, capG)
+    dome(1.8, 1.8, 1.8, 15.8, steel({ Color = STEEL }), capG)
+    cylP(0.16, 1.5, 16.8, steel({ Color = STEEL }), 0, 0, capG)
+    local tipB = mk(model, { Shape = Enum.PartType.Ball, Size = Vector3.new(0.4, 0.4, 0.4), Color = GREEN, Material = Enum.Material.Neon })
+    reg(tipB, CFrame.new(0, 17.6, 0), capG)
+    table.insert(neons, tipB)
+    neonCyl(5.6, 0.04, 12.17, 0, 0, capG) -- светящийся «потолок» колбы
+    for _, r in ipairs(rails) do
+        local a = Vector3.new(r.X, 12.95, r.Z).Unit
+        local from = Vector3.new(a.X * 3.6, 12.95, a.Z * 3.6)
+        local to = Vector3.new(r.X, 12.95, r.Z)
+        local len = (to - from).Magnitude
+        blk(Vector3.new(0.5, 0.36, len), CFrame.lookAt((from + to) / 2, to), steel({ Color = Color3.fromRGB(46, 52, 60) }), capG)
+        cylP(1.05, 0.8, 12.95, steel({ Color = Color3.fromRGB(70, 77, 86) }), r.X, r.Z, capG)
+        neonCyl(1.15, 0.08, 13.4, r.X, r.Z, capG)
     end
 
-    -- ступенька
-    local step = mk(model, { Size = Vector3.new(4.2, 0.6, 1.4), Color = METAL, Material = Enum.Material.Metal, CanCollide = true, CanQuery = true })
-    step.CFrame = cf * CFrame.new(0, 0.3, -5.6)
 
-    -- панель статуса
-    local ped = mk(model, { Size = Vector3.new(1.6, 2.2, 1.2), Color = METAL, Material = Enum.Material.Metal, CanCollide = true })
-    ped.CFrame = cf * CFrame.new(6.8, 1.1, -1.2)
+    ----- ПУЛЬТ СО ЭКРАНОМ -----
+    cylP(1.9, 0.3, 0.15, solid(), 6.9, -1.4)
+    cylP(0.7, 1.9, 1.2, solid({ Color = Color3.fromRGB(58, 65, 74) }), 6.9, -1.4)
+    local panelCF = cf * CFrame.lookAt(Vector3.new(6.9, 3.2, -1.4), Vector3.new(4.5, 2.9, -6))
+    local bezel = mk(model, { Size = Vector3.new(3.9, 2.3, 0.25), Color = Color3.fromRGB(26, 30, 36), Material = Enum.Material.Metal })
+    bezel.CFrame = panelCF * CFrame.new(0, 0, 0.1)
     local screen = mk(model, { Size = Vector3.new(3.6, 2, 0.15), Color = Color3.fromRGB(8, 12, 10) })
-    screen.CFrame = cf * CFrame.lookAt(Vector3.new(6.8, 3.3, -1.2), Vector3.new(4.5, 3.0, -6))
+    screen.CFrame = panelCF * CFrame.new(0, 0, -0.05)
+    for i, col in ipairs({ GREEN, AMBER, Color3.fromRGB(255, 80, 80) }) do
+        local b = mk(model, { Size = Vector3.new(0.34, 0.2, 0.2), Color = col, Material = Enum.Material.Neon })
+        b.CFrame = panelCF * CFrame.new((i - 2) * 0.9, -1.38, -0.12)
+    end
     local sg = Instance.new("SurfaceGui")
     sg.Face = Enum.NormalId.Front
     sg.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
@@ -358,6 +593,16 @@ local function buildPod(cf, char, hum, hrp)
     lbl.Text = ""
     lbl.Parent = sg
 
+
+    -- кабели
+    local rubber = Color3.fromRGB(20, 22, 25)
+    cable(Vector3.new(5.2, 0.7, -0.4), Vector3.new(6.9, 0.45, -1.4), 0.5, 0.28, rubber)
+    cable(Vector3.new(5.1, 0.8, 1.2), Vector3.new(6.7, 0.45, -1.2), 0.7, 0.24, rubber)
+    cable(Vector3.new(3.25, 1.5, 3.25), Vector3.new(5.0, 0.8, 1.9), 0.9, 0.3, rubber)
+    cable(Vector3.new(-3.25, 1.5, 3.25), Vector3.new(-5.1, 0.8, 1.2), 0.9, 0.3, rubber)
+    cable(Vector3.new(5.15, 0.9, 0.2), Vector3.new(6.9, 1.6, -1.2), 0.4, 0.1, GREEN, Enum.Material.Neon)
+
+
     function pod.setStatus(en, ru)
         lbl.Text = " PHOENIX PROJECT\n SUBJ: " .. LP.DisplayName .. "\n > " .. en
         if statusLbl and ru then statusLbl.Text = "Статус: " .. ru end
@@ -366,8 +611,13 @@ local function buildPod(cf, char, hum, hrp)
         for _, p in ipairs(neons) do p.Color = c end
         light.Color = (c == GREEN) and WATER or c
     end
+    function pod.moveGroup(g, dy)
+        local o = CFrame.new(0, dy, 0)
+        for _, it in ipairs(g) do it[1].CFrame = cf * o * it[2] end
+    end
 
-    -- пузырьки
+
+    ----- ЧАСТИЦЫ -----
     local bub = mk(model, { Size = Vector3.new(5, 0.2, 5), Transparency = 1 })
     bub.CFrame = cf * CFrame.new(0, 1.7, 0)
     local em = Instance.new("ParticleEmitter")
@@ -383,21 +633,38 @@ local function buildPod(cf, char, hum, hrp)
     em.Parent = bub
     pod.bubbleEm = em
 
-    -- люки и щупальца (спрятаны в базе)
-    local bases = { Vector3.new(-3.5, 0.7, -2.4), Vector3.new(3.5, 0.7, -2.4), Vector3.new(0, 0.7, -3.9) }
+
+    local smokeP = mk(model, { Size = Vector3.new(7, 0.2, 7), Transparency = 1 })
+    smokeP.CFrame = cf * CFrame.new(0, 1.5, 0)
+    local sm = Instance.new("ParticleEmitter")
+    sm.Texture = "rbxasset://textures/particles/smoke_main.dds"
+    sm.Rate = 0
+    sm.Lifetime = NumberRange.new(1.6, 2.8)
+    sm.Speed = NumberRange.new(3, 6)
+    sm.SpreadAngle = Vector2.new(70, 70)
+    sm.EmissionDirection = Enum.NormalId.Top
+    sm.Color = ColorSequence.new(Color3.fromRGB(215, 255, 240))
+    sm.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 2), NumberSequenceKeypoint.new(1, 7) })
+    sm.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.55), NumberSequenceKeypoint.new(1, 1) })
+    sm.Parent = smokeP
+    pod.smoke = sm
+
+
+    ----- ЛЮКИ И ЩУПАЛЬЦА (спрятаны в базе) -----
+    local bases = { Vector3.new(-3.5, 0.7, -2.5), Vector3.new(3.5, 0.7, -2.5), Vector3.new(0, 0.7, -4.3) }
     for _, b in ipairs(bases) do
-        neonCyl(1.7, 0.04, 1.21, b.X, b.Z)
-        cylP(1.5, 0.06, 1.23, { Color = Color3.fromRGB(20, 22, 26), Material = Enum.Material.Metal }, b.X, b.Z)
+        neonCyl(1.4, 0.04, 1.21, b.X, b.Z)
+        cylP(1.15, 0.06, 1.23, steel({ Color = Color3.fromRGB(20, 22, 26) }), b.X, b.Z)
         table.insert(pod.arms, buildArm(model, cf:PointToWorldSpace(b)))
     end
+
 
     ---------------------------------------------------------------
     function pod.resetInstant()
         pod.fadeId += 1
         pod.pose = nil
-        pod.put(pod.glass, GLASS_Y)
-        pod.put(pod.cap, CAP_Y)
-        pod.put(pod.capRing, CAP_Y - 0.5)
+        pod.moveGroup(glassG, 0)
+        pod.moveGroup(capG, 0)
         pod.liquid.Size = Vector3.new(LIQ_H, LIQ_D, LIQ_D)
         pod.put(pod.liquid, LIQ_B + LIQ_H / 2)
         pod.liquid.Transparency = 0.55
@@ -411,15 +678,15 @@ local function buildPod(cf, char, hum, hrp)
         end
     end
 
+
     function pod.resetAnimated(my)
         pod.fadeId += 1
         pod.setStatus("RECHARGING", "Перезарядка колбы...")
         pod.liquid.Transparency = 0.55
         animate(3.0, function(a)
             local ga = ease(clamp01(a / 0.45))
-            pod.put(pod.glass, GLASS_Y - (GLASS_H + 0.4) * (1 - ga))
-            pod.put(pod.cap, CAP_Y + 3.4 * (1 - ga))
-            pod.put(pod.capRing, CAP_Y - 0.5 + 3.4 * (1 - ga))
+            pod.moveGroup(glassG, -(GLASS_H + 0.4) * (1 - ga))
+            pod.moveGroup(capG, CAP_RISE * (1 - ga))
             local la = ease(clamp01((a - 0.35) / 0.65))
             local h = math.max(0.06, LIQ_H * la)
             local d = lerp(9.6, LIQ_D, la)
@@ -437,18 +704,21 @@ local function buildPod(cf, char, hum, hrp)
         notify("Колба перезаряжена: новый клон готов", 3)
     end
 
+
     -- главный цикл рендера
     pod.conn = RunService.RenderStepped:Connect(function()
         local t = os.clock()
         if pod.clone and pod.clone.Parent and pod.clone.PrimaryPart then
             local y = pod.floatY + math.sin(t * 1.2) * 0.28
             pod.clone:PivotTo(cf * CFrame.new(0, y, 0)
-                * CFrame.Angles(math.sin(t * 0.8) * 0.08, math.sin(t * 0.4) * 0.35, math.sin(t * 0.6) * 0.05))
+                * CFrame.Angles(math.sin(t * 0.8) * 0.1, math.sin(t * 0.4) * 0.55, math.sin(t * 0.6) * 0.08))
+            if pod.cloneRig then applyRig(pod.cloneRig, 1 + math.sin(t * 1.3) * 0.03) end
         end
         local po = pod.pose
         if po and pod.hrp and pod.hrp.Parent then
             pod.hrp.CFrame = cf * CFrame.new(0, po.y + math.sin(t * 1.2) * po.amp, 0)
-                * CFrame.Angles(math.sin(t * 0.8) * po.tilt, math.sin(t * 0.4) * po.tilt * 3, math.sin(t * 0.6) * po.tilt * 0.6)
+                * CFrame.Angles(math.sin(t * 0.8) * po.tilt, math.sin(t * 0.4) * po.tilt * 5, math.sin(t * 0.6) * po.tilt * 0.8)
+            if pod.rig then applyRig(pod.rig, po.crouch) end
         end
         for _, A in ipairs(pod.arms) do
             if A.e > 0 or A.dirty then
@@ -458,10 +728,12 @@ local function buildPod(cf, char, hum, hrp)
         end
     end)
 
+
     pod.resetInstant()
     makeClone(pod, char)
     return pod
 end
+
 
 ---------------------------------------------------------------------
 -- ЭФФЕКТЫ ВОДЫ
@@ -485,6 +757,7 @@ local function drop(pod, pos, vel)
     Debris:AddItem(p, 2.6)
 end
 
+
 local function flash(pod, pos, color)
     local f = mk(pod.model, {
         Shape = Enum.PartType.Ball, Size = Vector3.new(1, 1, 1), Color = color,
@@ -495,6 +768,7 @@ local function flash(pod, pos, color)
         { Size = Vector3.new(7, 7, 7), Transparency = 1 }):Play()
     Debris:AddItem(f, 0.7)
 end
+
 
 local function makePlate(size, tex)
     local p = mk(nil, {
@@ -515,6 +789,7 @@ local function makePlate(size, tex)
     return p
 end
 
+
 ---------------------------------------------------------------------
 -- ОДЕВАНИЕ ЩУПАЛЬЦАМИ
 ---------------------------------------------------------------------
@@ -522,6 +797,7 @@ local function dressSequence(pod, my, char, hum, hrp)
     local function chk()
         if my ~= session or P ~= pod or not char.Parent then error(ABORT, 0) end
     end
+
 
     local flat = pod.cf.Position - hrp.Position
     flat = Vector3.new(flat.X, 0, flat.Z)
@@ -531,12 +807,15 @@ local function dressSequence(pod, my, char, hum, hrp)
     local pos = hrp.Position
     local face = -toPod
 
+
     pod.setStatus("DRESSING SUBJECT", "Щупальца одевают тебя...")
     notify("Щупальца достают твою одежду...", 3)
+
 
     local shirtTex, pantsTex
     for _, i in ipairs(outfit.shirt) do if i:IsA("Shirt") then shirtTex = i.ShirtTemplate end end
     for _, i in ipairs(outfit.pants) do if i:IsA("Pants") then pantsTex = i.PantsTemplate end end
+
 
     local pending = 0
     local function runJob(A, delay, prop, tgt, hang, applyFn)
@@ -558,6 +837,7 @@ local function dressSequence(pod, my, char, hum, hrp)
             pending -= 1
         end)
     end
+
 
     local d = 0
     if #outfit.shirt > 0 then
@@ -591,11 +871,13 @@ local function dressSequence(pod, my, char, hum, hrp)
             function() wear(outfit.accs, char, hum) end)
     end
 
+
     task.wait(0.2)
     while pending > 0 do chk() task.wait(0.1) end
     chk()
     hrp.Anchored = false
 end
+
 
 ---------------------------------------------------------------------
 -- ВОЗРОЖДЕНИЕ В КОЛБЕ
@@ -609,11 +891,13 @@ local function waitAppearance(char)
     task.wait(0.3)
 end
 
+
 local function revive(char)
     local pod = P
     if not pod then return end
     session += 1
     local my = session
+
 
     local ok, err = pcall(function()
         local hum = char:WaitForChild("Humanoid", 10)
@@ -623,24 +907,38 @@ local function revive(char)
             if my ~= session or P ~= pod or not char.Parent then error(ABORT, 0) end
         end
 
+
+        releaseRig(pod)
         pod.standY = FLOOR_TOP + standOffset(hum, hrp)
-        pod.floatY = pod.standY + 1.5
+        pod.floatY = pod.standY + 1.7
+
 
         startFx()
         setOverlay(0, "ПРОЕКТ «ФЕНИКС»\nперенос сознания...")
         pod.resetInstant()
         if pod.clone then pod.clone:Destroy() pod.clone = nil end
 
+
+        -- отключаем анимации, чтобы поза на корточках не сбрасывалась
+        local an = char:FindFirstChild("Animate") or char:WaitForChild("Animate", 2)
+        if an then an.Disabled = true; pod.animScript = an end
+        stopAnims(hum)
+
+
         hrp.Anchored = true
         hrp.CFrame = pod.cf * CFrame.new(0, pod.floatY, 0)
         hum.PlatformStand = true
         pod.hrp = hrp
-        pod.pose = { y = pod.floatY, amp = 0.25, tilt = 0.08 }
+        pod.rig = buildRig(char)
+        pod.pose = { y = pod.floatY, amp = 0.25, tilt = 0.1, crouch = 1 }
         pod.setStatus("CONSCIOUSNESS TRANSFER", "Перенос сознания...")
 
+
         waitAppearance(char); chk()
+        stopAnims(hum)
         stripOutfit(char)
         blur.Size = 26
+
 
         -- загрузка сознания
         animate(2.6, function(a)
@@ -651,6 +949,7 @@ local function revive(char)
         end, my)
         setOverlay(1)
 
+
         -- пробуждение
         pod.setNeon(AMBER)
         pod.setStatus("SUBJECT AWAKE", "Ты проснулся в теле клона")
@@ -659,14 +958,18 @@ local function revive(char)
             blur.Size = 12 * (1 - a)
             cc.TintColor = Color3.fromRGB(150, 255, 215):Lerp(Color3.new(1, 1, 1), a)
             cc.Brightness = lerp(-0.05, 0, a)
-            pod.pose.tilt = 0.08 + 0.1 * math.sin(a * math.pi * 6) * (1 - a)
+            pod.pose.tilt = 0.1 + 0.1 * math.sin(a * math.pi * 6) * (1 - a)
+            pod.pose.crouch = 1 - 0.12 * math.sin(a * math.pi * 3) * (1 - a)
         end, my)
         endFx()
+
 
         -- вскрытие колбы и слив
         pod.setStatus("CONTAINMENT BREACH", "Колба вскрывается!")
         pod.bubbleEm.Enabled = false
         pod.puddle = pod.cylP(9, 0.07, 0.04, { Color = WATER, Transparency = 0.3, Material = Enum.Material.Glass, Reflectance = 0.15 })
+        task.delay(0.35, function() if my == session and P == pod then pod.smoke:Emit(60) end end)
+
 
         task.spawn(function()
             pcall(function()
@@ -699,31 +1002,33 @@ local function revive(char)
             end)
         end)
 
-        local liquid, glass = pod.liquid, pod.glass
-        animate(2.7, function(a)
-            local t = a * 2.7
-            local ca = ease(clamp01(t / 0.9))
-            pod.put(pod.cap, CAP_Y + 3.4 * ca)
-            pod.put(pod.capRing, CAP_Y - 0.5 + 3.4 * ca)
-            local ga = ease(clamp01((t - 0.2) / 1.0))
-            pod.put(glass, GLASS_Y - (GLASS_H + 0.4) * ga)
+
+        local liquid = pod.liquid
+        animate(2.9, function(a)
+            local t = a * 2.9
+            pod.moveGroup(pod.capG, CAP_RISE * ease(clamp01(t / 1.0)))
+            pod.moveGroup(pod.glassG, -(GLASS_H + 0.4) * ease(clamp01((t - 0.2) / 1.0)))
             local la = clamp01((t - 0.5) / 2.1)
             local h = math.max(0.06, LIQ_H * (1 - la * la))
             local d = lerp(LIQ_D, 9.6, la)
             liquid.Size = Vector3.new(h, d, d)
             pod.put(liquid, LIQ_B + h / 2)
             liquid.Transparency = lerp(0.55, 0.4, la)
-            local fa = ease(clamp01((t - 1.0) / 1.6))
+            -- клон распрямляется и опускается на пол
+            local fa = ease(clamp01((t - 1.0) / 1.8))
             pod.pose.y = lerp(pod.floatY, pod.standY, fa)
             pod.pose.amp = 0.25 * (1 - fa)
-            pod.pose.tilt = 0.08 * (1 - fa)
+            pod.pose.tilt = 0.1 * (1 - fa)
+            pod.pose.crouch = 1 - fa
             local pd = lerp(9, 17.5, ease(clamp01((t - 0.6) / 2.1)))
             pod.puddle.Size = Vector3.new(0.07, pd, pd)
             pod.put(pod.puddle, 0.04)
         end, my)
 
+
         -- освобождаем игрока
         pod.pose = nil
+        releaseRig(pod)
         hrp.CFrame = pod.cf * CFrame.new(0, pod.standY, 0)
         hrp.Anchored = false
         hum.PlatformStand = false
@@ -732,6 +1037,7 @@ local function revive(char)
         pod.setStatus("AWAITING EXIT", "Выйди из колбы")
         notify("Выйди из колбы — манипуляторы выдадут одежду", 5)
 
+
         -- плавно убираем плёнку воды
         local fid = pod.fadeId + 1
         pod.fadeId = fid
@@ -739,25 +1045,27 @@ local function revive(char)
             pcall(function()
                 local t0 = os.clock()
                 while os.clock() - t0 < 5 and pod.fadeId == fid do
-                    local a = (os.clock() - t0) / 5
-                    liquid.Transparency = lerp(0.4, 1, a)
+                    liquid.Transparency = lerp(0.4, 1, (os.clock() - t0) / 5)
                     task.wait()
                 end
             end)
         end)
 
+
         -- ждём, пока выйдешь из колбы
         while true do
             chk()
             local dv = hrp.Position - pod.cf.Position
-            if Vector3.new(dv.X, 0, dv.Z).Magnitude > 7.8 then break end
+            if Vector3.new(dv.X, 0, dv.Z).Magnitude > 8.4 then break end
             task.wait(0.15)
         end
+
 
         dressSequence(pod, my, char, hum, hrp)
         chk()
         pod.resetAnimated(my)
     end)
+
 
     if not ok then
         if err ~= ABORT then warn("[Phoenix] " .. tostring(err)) end
@@ -767,11 +1075,12 @@ local function revive(char)
             local r = char:FindFirstChild("HumanoidRootPart")
             if r then r.Anchored = false end
             if h then h.PlatformStand = false end
-            if pod then pod.pose = nil end
+            if pod then pod.pose = nil; releaseRig(pod) end
             wearAll(char)
         end
     end
 end
+
 
 ---------------------------------------------------------------------
 -- УСТАНОВКА / УДАЛЕНИЕ
@@ -781,6 +1090,7 @@ local function removePod()
     if P then
         if P.conn then P.conn:Disconnect() end
         if P.hrp and P.hrp.Parent then P.hrp.Anchored = false end
+        releaseRig(P)
         local char = LP.Character
         local hum = char and char:FindFirstChildOfClass("Humanoid")
         if hum then hum.PlatformStand = false end
@@ -792,6 +1102,7 @@ local function removePod()
     if overlay then setOverlay(1) end
     if statusLbl then statusLbl.Text = "Статус: колбы нет" end
 end
+
 
 local function placePod()
     local char = LP.Character
@@ -805,7 +1116,7 @@ local function placePod()
     local look = hrp.CFrame.LookVector
     look = Vector3.new(look.X, 0, look.Z)
     look = look.Magnitude > 0.01 and look.Unit or Vector3.new(0, 0, -1)
-    local origin = hrp.Position + look * 14
+    local origin = hrp.Position + look * 15
     local rp = RaycastParams.new()
     rp.FilterType = Enum.RaycastFilterType.Exclude
     rp.FilterDescendantsInstances = { char }
@@ -816,6 +1127,7 @@ local function placePod()
     P.setStatus("STANDBY", "Колба готова. Умри, чтобы проснуться в ней")
     notify("Колба установлена. Умри — и проснёшься в клоне", 4)
 end
+
 
 ---------------------------------------------------------------------
 -- ИНТЕРФЕЙС
@@ -828,10 +1140,12 @@ local function buildGui()
     gui.DisplayOrder = 999
     gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
+
     local okp = false
     if gethui then okp = pcall(function() gui.Parent = gethui() end) end
     if not okp then okp = pcall(function() gui.Parent = game:GetService("CoreGui") end) end
     if not okp or not gui.Parent then gui.Parent = LP:WaitForChild("PlayerGui") end
+
 
     -- чёрный экран пробуждения
     overlay = Instance.new("Frame")
@@ -851,6 +1165,7 @@ local function buildGui()
     overlayText.ZIndex = 51
     overlayText.Parent = overlay
 
+
     -- уведомления
     toast = Instance.new("TextLabel")
     toast.AnchorPoint = Vector2.new(0.5, 1)
@@ -866,6 +1181,7 @@ local function buildGui()
     toast.Parent = gui
     Instance.new("UICorner", toast).CornerRadius = UDim.new(0, 10)
     local ts = Instance.new("UIStroke", toast); ts.Color = GREEN; ts.Transparency = 0.5
+
 
     -- главное окно
     local main = Instance.new("Frame")
@@ -885,8 +1201,10 @@ local function buildGui()
     local list = Instance.new("UIListLayout", main)
     list.Padding = UDim.new(0, 6); list.SortOrder = Enum.SortOrder.LayoutOrder
 
+
     local order = 0
     local function nextOrder() order += 1 return order end
+
 
     local title = Instance.new("TextLabel")
     title.Size = UDim2.new(1, 0, 0, 26)
@@ -899,6 +1217,7 @@ local function buildGui()
     title.Active = true
     title.Parent = main
 
+
     statusLbl = Instance.new("TextLabel")
     statusLbl.Size = UDim2.new(1, 0, 0, 32)
     statusLbl.BackgroundTransparency = 1
@@ -909,6 +1228,7 @@ local function buildGui()
     statusLbl.TextWrapped = true
     statusLbl.LayoutOrder = nextOrder()
     statusLbl.Parent = main
+
 
     local function button(text, color, cb)
         local b = Instance.new("TextButton")
@@ -926,6 +1246,7 @@ local function buildGui()
         return b
     end
 
+
     button("Поставить колбу", GREEN, placePod)
     button("Убрать колбу", Color3.fromRGB(255, 200, 120), function()
         removePod()
@@ -939,6 +1260,7 @@ local function buildGui()
     button("Закрыть скрипт", Color3.fromRGB(180, 190, 195), function()
         if getgenv and getgenv().__PHOENIX_CLEANUP then getgenv().__PHOENIX_CLEANUP() end
     end)
+
 
     -- перетаскивание
     local dragging, dragStart, startPos
@@ -958,6 +1280,7 @@ local function buildGui()
     end))
 end
 
+
 ---------------------------------------------------------------------
 -- ЗАПУСК
 ---------------------------------------------------------------------
@@ -968,6 +1291,7 @@ local function cleanup()
     if getgenv then getgenv().__PHOENIX_CLEANUP = nil end
 end
 if getgenv then getgenv().__PHOENIX_CLEANUP = cleanup end
+
 
 buildGui()
 table.insert(uiConns, LP.CharacterAdded:Connect(function(char)
