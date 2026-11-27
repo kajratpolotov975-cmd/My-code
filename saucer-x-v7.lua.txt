@@ -1,773 +1,1314 @@
 --[[
-  SAUCER-X v7 — тарелка Рика для Delta (Roblox)
+  SAUCER-X v7 — Летающая тарелка Рика (Delta / Roblox)
 
-  Что исправлено:
-  1) Купол СТВЁРДЫЙ. Сквозь него пройти нельзя, внутрь — только через дверь.
-  2) Кресло пассажира (справа) — просто сидишь. Летать можно только в кресле с рулём (слева).
-  3) Двери, капот и багажник открываются ТАПОМ по ним. Тап ещё раз — закроется. Кнопок нет.
+  ЧТО НОВОГО В v7:
+  - КУПОЛ ТЕПЕРЬ ТВЁРДЫЙ: стекло собрано из настоящих панелей (CanCollide = true).
+    Купол внутри пустой, сквозь стекло пройти нельзя, только через открытую дверь.
+    Камера и нажатия при этом проходят сквозь стекло (камера не упирается, на кресла можно нажать).
+  - ПАССАЖИРСКОЕ КРЕСЛО: справа (где нет руля) ты просто сидишь, лететь нельзя.
+    Лететь можно только с левого (пилотского) кресла со штурвалом.
+  - ДВЕРИ (левая и правая отдельно), КАПОТ и БАГАЖНИК: открываются тапом прямо на них,
+    ещё один тап закрывает. Кнопок открыть/закрыть нет.
+  - Двери опускаются трапом до земли, заходишь пешком.
 
-  Работает локально (видишь только ты).
+  УПРАВЛЕНИЕ
+    Тап по двери / капоту / багажнику ... открыть / закрыть
+    Тап по креслу ....................... сесть (слева пилот, справа пассажир)
+    Тап по фаре ......................... свет вкл / выкл
+    Джойстик / WASD ..................... лететь (вперёд = туда, куда смотрит камера)
+    Прыжок / Space ...................... вверх     Ctrl / Q ... вниз     Shift ... ускорение
+    L свет | V вид из кабины | B колёса | G сесть / выйти
+
+  СТОЛКНОВЕНИЯ (v7.1)
+    Тарелка больше не пролетает сквозь стены и препятствия: она упирается, скользит вдоль стены
+    и отскакивает, камера трясётся. Пологие склоны проезжает, высокие ступени и стены — преграда.
+    В коде есть CRASH_DAMAGE: поставь число (например 30), и сильный удар будет ранить персонажа.
+  Синее свечение (пламя, голубой свет и неон) убрано.
 ]]
 
 local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UIS        = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
 local Workspace  = game:GetService("Workspace")
-local LP = Players.LocalPlayer
 
--- ===================== НАСТРОЙКИ =====================
-local CFG = {
-  SPEED = 70,              -- скорость полёта (x1)
-  VSPEED = 42,             -- скорость вверх/вниз
-  TURN = 3.2,              -- как быстро нос поворачивается
-  SPAWN_DIST = 34,         -- на каком расстоянии от тебя появится тарелка
-  LAND_H = 2.0,            -- высота пола над землёй при посадке
-  DOME_R = 7.5,            -- радиус купола
-  GLASS_TRANSPARENCY = 0.55,
+local env = (getgenv and getgenv()) or _G
+if env.__SaucerX then pcall(env.__SaucerX) end
+
+local lp = Players.LocalPlayer
+
+---------------------------------------------------------------------
+-- Состояние
+---------------------------------------------------------------------
+local connections = {}
+local function connect(sig, fn)
+	local c = sig:Connect(fn)
+	connections[#connections + 1] = c
+	return c
+end
+
+local ship, root
+local gui, statusLabel, hudLabel, exitBtn
+local ui = {}
+local lastMsg = "Нажми 🛸 чтобы создать тарелку"
+
+local GROUPS = { "doorL", "doorR", "hood", "trunk", "gear" }
+local anim = { steer = {} }
+local alpha, gen = {}, {}
+for _, g in ipairs(GROUPS) do anim[g] = {}; alpha[g] = 0; gen[g] = 0 end
+
+local state = {
+	doorL = false, doorR = false, hood = false, trunk = false,
+	gear = false,      -- true = колёса убраны
+	lights = true, seated = false, pilot = false, fp = false,
+	fire = false, gearAuto = true,
 }
 
--- если скрипт запущен повторно — убираем старую тарелку
-local ENV = (getgenv and getgenv()) or _G
-if ENV.SaucerX_Cleanup then pcall(ENV.SaucerX_Cleanup) end
+local speed = 70
+local pos, yaw, pitch, roll, vel = Vector3.zero, 0, 0, 0, Vector3.zero
+local yawRate = 0
+local lastCF = CFrame.new()
+local seatSide = -1          -- -1 = левое (пилот), 1 = правое (пассажир)
+local saved = nil
+local jumpT = 0
 
-local char = LP.Character or LP.CharacterAdded:Wait()
-char:WaitForChild("HumanoidRootPart")
+local clickActs, passThrough, hints = {}, {}, {}
+local lightList, lensList, flames = {}, {}, {}
+local flamePower, lastFlame = 0, -1
+local shake, shakeOn = 0, false      -- тряска камеры после удара
+local excl, exclTimer = {}, 0        -- что игнорировать при столкновениях (тарелка и персонажи)
+local wheelSpin, lastSpin = 0, 0
+local steerAng, lastSteer = 0, 0
+local curAlt = 0
+local hudTimer = 0
+local camYaw = 0
+local doorOpen = 2.1
 
-local conns = {}
-local function bind(signal, fn)
-  local c = signal:Connect(fn)
-  table.insert(conns, c)
-  return c
+local exitShip, enterShip, refreshUI, setLights, destroyShip, setFirstPerson, setGroup
+
+local REST_DOWN = 2.05       -- высота центра над землёй, когда колёса выпущены
+local REST_UP   = 1.1        -- когда колёса убраны
+local SEAT_X    = 1.9
+local SEAT_TOP  = 1.4
+local SIT_OFF   = 1.3
+
+local C = {
+	hull    = Color3.fromRGB(118, 122, 104),
+	hull2   = Color3.fromRGB(88, 92, 80),
+	dark    = Color3.fromRGB(44, 46, 44),
+	black   = Color3.fromRGB(24, 26, 29),
+	orange  = Color3.fromRGB(255, 192, 36),
+	red     = Color3.fromRGB(255, 70, 60),
+	glass   = Color3.fromRGB(122, 160, 185),
+	brass   = Color3.fromRGB(160, 132, 64),
+	tape    = Color3.fromRGB(196, 196, 182),
+	seat    = Color3.fromRGB(104, 76, 72),
+	cushion = Color3.fromRGB(146, 98, 92),
+	can     = Color3.fromRGB(205, 100, 135),
+	silver  = Color3.fromRGB(180, 184, 190),
+	bottle  = Color3.fromRGB(34, 110, 68),
+	bottle2 = Color3.fromRGB(64, 136, 168),
+	blueFire = Color3.fromRGB(35, 140, 255),
+	cyanFire = Color3.fromRGB(110, 225, 255),
+	coreFire = Color3.fromRGB(220, 250, 255),
+	green   = Color3.fromRGB(110, 255, 130),
+	copper  = Color3.fromRGB(184, 115, 51),
+	cyan    = Color3.fromRGB(110, 230, 255),
+	lens    = Color3.fromRGB(255, 244, 205),
+}
+
+local function say(text)
+	lastMsg = text
+	if statusLabel then statusLabel.Text = text end
 end
 
--- ===================== СОСТОЯНИЕ =====================
-local interact = {}      -- part -> {fn=функция, range=дистанция}
-local glassSet = {}      -- стекло: тап проходит сквозь него
-local seats, mechs = {}, {}
-local sitSeat, sitWeld, sitTime = nil, nil, 0
-local lastExit = 0
-local mode, autoClosed = "none", false
-local upHeld, downHeld = false, false
-local speedMul = 1
-local pos, yaw, tiltP, tiltR = Vector3.new(0, 50, 0), 0, 0, 0
-local vel = Vector3.zero
-local lastCF = nil
-
-local toast, sitOn, standUp, cleanup  -- определяются ниже
-
-local function getHum()
-  local c = LP.Character
-  return c and c:FindFirstChildOfClass("Humanoid")
-end
-local function getHRP()
-  local c = LP.Character
-  return c and c:FindFirstChild("HumanoidRootPart")
-end
-local function wrapAngle(a)
-  return (a + math.pi) % (math.pi * 2) - math.pi
+local function getChar()
+	local c = lp.Character
+	if not c then return nil end
+	return c, c:FindFirstChildOfClass("Humanoid"), c:FindFirstChild("HumanoidRootPart")
 end
 
--- ===================== ПОСТРОЙКА ТАРЕЛКИ =====================
-local model = Instance.new("Model")
-model.Name = "SaucerX_v7"
-
-local C_HULL  = Color3.fromRGB(78, 84, 98)
-local C_DARK  = Color3.fromRGB(32, 36, 44)
-local C_GREEN = Color3.fromRGB(120, 255, 90)
-local C_GLASS = Color3.fromRGB(150, 235, 255)
-local C_AMBER = Color3.fromRGB(255, 170, 60)
-
-local function newPart(cf, size, color, material, o)
-  o = o or {}
-  local p = Instance.new("Part")
-  p.Anchored = true
-  p.Size = size
-  p.CFrame = cf
-  p.Color = color
-  p.Material = material or Enum.Material.Metal
-  p.Transparency = o.transparency or 0
-  p.Reflectance = o.reflectance or 0
-  p.CanCollide = (o.collide ~= false)   -- по умолчанию ТВЁРДЫЙ
-  p.CanQuery = true
-  p.CanTouch = false
-  p.CastShadow = (o.shadow ~= false)
-  p.TopSurface = Enum.SurfaceType.Smooth
-  p.BottomSurface = Enum.SurfaceType.Smooth
-  if o.shape then p.Shape = o.shape end
-  p.Parent = model
-  return p
+local function groundY(from, ignore)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignore
+	local res = Workspace:Raycast(from, Vector3.new(0, -800, 0), params)
+	return res and res.Position.Y or nil
 end
 
-local function disc(cf, diameter, thick, color, material, o)
-  local oo = {}
-  if o then for k, v in pairs(o) do oo[k] = v end end
-  oo.shape = Enum.PartType.Cylinder
-  return newPart(cf * CFrame.Angles(0, 0, math.rad(90)), Vector3.new(thick, diameter, diameter), color, material, oo)
-end
-
-local function addLight(parent, color, brightness, range)
-  local l = Instance.new("PointLight")
-  l.Color = color
-  l.Brightness = brightness
-  l.Range = range
-  l.Parent = parent
-end
-
-local root = newPart(CFrame.new(), Vector3.new(1, 1, 1), C_DARK, Enum.Material.Plastic, {transparency = 1, collide = false})
-root.CanQuery = false
-model.PrimaryPart = root
-
--- ---------- механизмы (двери / капот / багажник) ----------
-local function clearOfChar(m)
-  local c = LP.Character
-  if not c then return true end
-  local params = OverlapParams.new()
-  params.FilterType = Enum.RaycastFilterType.Include
-  params.FilterDescendantsInstances = {c}
-  for _, it in ipairs(m.items) do
-    if #Workspace:GetPartsInPart(it.part, params) > 0 then return false end
-  end
-  return true
-end
-
-local function applyMech(m, rootCF)
-  local rot = (m.axis == "Y") and CFrame.Angles(0, m.cur, 0) or CFrame.Angles(m.cur, 0, 0)
-  local base = rootCF * m.hinge * rot
-  for _, it in ipairs(m.items) do
-    it.part.CFrame = base * it.rel
-  end
-end
-
-local function toggleMech(m, silent)
-  m.open = not m.open
-  m.target = m.open and m.openAngle or 0
-  m.solid = false
-  for _, it in ipairs(m.items) do it.part.CanCollide = false end
-  if not silent then toast(m.label .. (m.open and " — открыто" or " — закрыто")) end
-end
-
-local function resetMech(m)
-  m.cur, m.target, m.open, m.solid, m.dirty = 0, 0, false, true, true
-  for _, it in ipairs(m.items) do it.part.CanCollide = it.collide end
-end
-
-local function stepMech(m, dt, rootCF)
-  if m.dirty then
-    m.dirty = false
-    applyMech(m, rootCF)
-  end
-  if m.cur ~= m.target then
-    m.cur = m.cur + (m.target - m.cur) * math.min(1, dt * 7)
-    if math.abs(m.target - m.cur) < 0.004 then m.cur = m.target end
-    applyMech(m, rootCF)
-  elseif (not m.open) and (not m.solid) then
-    -- закрылось: делаем твёрдым, но только если в проёме никто не стоит
-    if clearOfChar(m) then
-      m.solid = true
-      for _, it in ipairs(m.items) do it.part.CanCollide = it.collide end
-    end
-  end
-end
-
-local function newMech(label, hingeCF, axis, openAngle, parts)
-  local m = {label = label, hinge = hingeCF, axis = axis, openAngle = openAngle,
-    cur = 0, target = 0, open = false, solid = true, dirty = false, items = {}}
-  for _, p in ipairs(parts) do
-    table.insert(m.items, {part = p, rel = hingeCF:ToObjectSpace(p.CFrame), collide = p.CanCollide})
-    interact[p] = {fn = function() toggleMech(m) end, range = 45}
-  end
-  table.insert(mechs, m)
-  return m
-end
-
-local function closeAll()
-  local n = 0
-  for _, m in ipairs(mechs) do
-    if m.open then toggleMech(m, true); n = n + 1 end
-  end
-  return n
-end
-
--- ---------- корпус ----------
-local R  = CFG.DOME_R
-local DZ = 0.5                               -- смещение центра купола по Z
-local CEN = Vector3.new(0, 0, DZ)
-
-disc(CFrame.new(0, -0.4, 0), 28, 0.8, Color3.fromRGB(70, 76, 88), Enum.Material.DiamondPlate)    -- палуба
-disc(CFrame.new(0, -1.3, 0), 18, 1.0, C_HULL, Enum.Material.Metal)                                -- днище
-disc(CFrame.new(0, -0.4, 0), 28.4, 0.3, C_GREEN, Enum.Material.Neon, {collide = false, shadow = false}) -- неоновый обод
-local thruster = disc(CFrame.new(0, -1.85, 0), 9, 0.15, C_GREEN, Enum.Material.Neon, {collide = false, shadow = false})
-addLight(thruster, C_GREEN, 1.6, 24)
-
-for i = 0, 15 do
-  local a = math.rad(i * 22.5)
-  newPart(CFrame.new(13.4 * math.cos(a), 0.12, 13.4 * math.sin(a)), Vector3.new(0.5, 0.25, 0.5),
-    (i % 2 == 0) and C_GREEN or C_AMBER, Enum.Material.Neon, {collide = false, shadow = false})
-end
-
-disc(CFrame.new(0, 0.1, DZ), R * 2 + 0.9, 0.2, C_DARK, Enum.Material.Metal)                       -- основание купола
-
--- ---------- КУПОЛ: твёрдые стеклянные панели ----------
-local N = 18
-local bands = {0, 28, 52, 74, 90}
-local rightCols = {[17] = true, [0] = true}   -- панели правой двери
-local leftCols  = {[8] = true,  [9] = true}   -- панели левой двери
-local doorR, doorL = {}, {}
-
-for b = 1, #bands - 1 do
-  local e0, e1 = math.rad(bands[b]), math.rad(bands[b + 1])
-  local em = (e0 + e1) / 2
-  local h = R * (e1 - e0) * 1.15 + 0.1
-  local w = 2 * R * math.cos(e0) * math.tan(math.pi / N) * 1.12 + 0.05
-  for j = 0, N - 1 do
-    local a = math.rad(j * (360 / N) + (180 / N))
-    local n = Vector3.new(math.cos(em) * math.cos(a), math.sin(em), math.cos(em) * math.sin(a))
-    local rr = R + ((j + b) % 2) * 0.06     -- чуть смещаем, чтобы стекло не мерцало
-    local P = CEN + n * rr
-    local p = newPart(CFrame.lookAt(P, P + n), Vector3.new(w, h, 0.6), C_GLASS, Enum.Material.Glass,
-      {transparency = CFG.GLASS_TRANSPARENCY, reflectance = 0.08, shadow = false})
-    -- CanCollide = true: купол ТВЁРДЫЙ
-    if b <= 2 and rightCols[j] then
-      table.insert(doorR, p)
-    elseif b <= 2 and leftCols[j] then
-      table.insert(doorL, p)
-    else
-      glassSet[p] = true
-    end
-  end
-end
-
-newPart(CFrame.new(CEN + Vector3.new(0, R + 0.15, 0)), Vector3.new(1.4, 1.4, 1.4), C_DARK, Enum.Material.Metal, {shape = Enum.PartType.Ball})
-local beacon = newPart(CFrame.new(CEN + Vector3.new(0, R + 0.95, 0)), Vector3.new(0.6, 0.6, 0.6), C_GREEN, Enum.Material.Neon, {shape = Enum.PartType.Ball, collide = false, shadow = false})
-addLight(beacon, C_GREEN, 1.5, 14)
-
--- ручки дверей (видно, куда тапать)
-local function handle(aDeg, eDeg)
-  local a, e = math.rad(aDeg), math.rad(eDeg)
-  local n = Vector3.new(math.cos(e) * math.cos(a), math.sin(e), math.cos(e) * math.sin(a))
-  local P = CEN + n * (R + 0.45)
-  return newPart(CFrame.lookAt(P, P + n), Vector3.new(0.35, 1.9, 0.35), C_GREEN, Enum.Material.Neon, {collide = false, shadow = false})
-end
-table.insert(doorR, handle(14, 20))
-table.insert(doorL, handle(186, 20))
-
-local function hingeAt(aDeg)
-  local a = math.rad(aDeg)
-  return CFrame.new(CEN + Vector3.new(R * math.cos(a), 0, R * math.sin(a)))
-end
--- дверь на петле у переднего края, открывается наружу
-newMech("Дверь пассажира", hingeAt(-20), "Y",  math.rad(70), doorR)
-newMech("Дверь водителя",  hingeAt(200), "Y", -math.rad(70), doorL)
-
--- ---------- КАПОТ (впереди) ----------
-local hoodGlow = newPart(CFrame.new(0, 0.3, -10.45), Vector3.new(7.8, 0.6, 5.0), C_GREEN, Enum.Material.Neon, {transparency = 0.3, shadow = false})
-addLight(hoodGlow, C_GREEN, 1.5, 14)
-local hoodLid = newPart(CFrame.new(0, 0.8, -10.45), Vector3.new(8.4, 0.4, 5.6), Color3.fromRGB(95, 104, 122), Enum.Material.Metal)
-local hoodStripe = newPart(CFrame.new(0, 1.03, -10.45), Vector3.new(0.5, 0.06, 5.0), C_GREEN, Enum.Material.Neon, {collide = false, shadow = false})
-newMech("Капот", CFrame.new(0, 0.8, -7.65), "X", math.rad(72), {hoodLid, hoodStripe})
-
--- ---------- БАГАЖНИК (сзади) ----------
-local cargo = newPart(CFrame.new(0, 0.3, 10.95), Vector3.new(7.8, 0.6, 4.0), C_AMBER, Enum.Material.Neon, {transparency = 0.45, shadow = false})
-addLight(cargo, C_AMBER, 1.2, 12)
-local trunkLid = newPart(CFrame.new(0, 0.8, 10.95), Vector3.new(8.4, 0.4, 4.6), Color3.fromRGB(95, 104, 122), Enum.Material.Metal)
-local trunkStripe = newPart(CFrame.new(0, 1.03, 10.95), Vector3.new(0.5, 0.06, 4.0), C_AMBER, Enum.Material.Neon, {collide = false, shadow = false})
-newMech("Багажник", CFrame.new(0, 0.8, 8.65), "X", -math.rad(72), {trunkLid, trunkStripe})
-
--- ---------- ПАНЕЛЬ И РУЛЬ ----------
-newPart(CFrame.new(0, 0.9, -4.0), Vector3.new(8, 1.4, 1.2), C_DARK, Enum.Material.Metal)
-newPart(CFrame.new(-2.4, 1.1, -3.37), Vector3.new(1.8, 0.9, 0.1), C_GREEN, Enum.Material.Neon, {collide = false, shadow = false})
-newPart(CFrame.new(2.4, 1.1, -3.37), Vector3.new(1.8, 0.9, 0.1), C_GLASS, Enum.Material.Neon, {collide = false, shadow = false})
-local screen = newPart(CFrame.new(0, 1.1, -3.37), Vector3.new(2.6, 0.9, 0.1), Color3.fromRGB(15, 40, 20), Enum.Material.Neon, {collide = false, shadow = false})
-do
-  local sg = Instance.new("SurfaceGui")
-  sg.Face = Enum.NormalId.Back
-  sg.CanvasSize = Vector2.new(260, 90)
-  sg.Parent = screen
-  local t = Instance.new("TextLabel")
-  t.Size = UDim2.new(1, 0, 1, 0)
-  t.BackgroundTransparency = 1
-  t.Text = "SAUCER-X v7"
-  t.TextColor3 = C_GREEN
-  t.Font = Enum.Font.Code
-  t.TextScaled = true
-  t.Parent = sg
-end
-
-local wheelCF = CFrame.new(-2.4, 2.7, -2.4) * CFrame.Angles(math.rad(-28), 0, 0)
-for k = 0, 9 do
-  local ang = math.rad(k * 36)
-  newPart(wheelCF * CFrame.new(0.95 * math.cos(ang), 0.95 * math.sin(ang), 0) * CFrame.Angles(0, 0, ang + math.rad(90)),
-    Vector3.new(0.72, 0.26, 0.26), C_DARK, Enum.Material.Metal, {collide = false, shadow = false})
-end
-newPart(wheelCF, Vector3.new(1.9, 0.18, 0.18), C_DARK, Enum.Material.Metal, {collide = false, shadow = false})
-newPart(wheelCF, Vector3.new(0.18, 1.9, 0.18), C_DARK, Enum.Material.Metal, {collide = false, shadow = false})
-newPart(wheelCF, Vector3.new(0.5, 0.5, 0.5), C_GREEN, Enum.Material.Neon, {shape = Enum.PartType.Ball, collide = false, shadow = false})
-do
-  local a0, a1 = Vector3.new(-2.4, 2.6, -2.45), Vector3.new(-2.4, 1.5, -3.45)
-  newPart(CFrame.lookAt((a0 + a1) / 2, a1), Vector3.new(0.4, 0.4, (a1 - a0).Magnitude), C_DARK, Enum.Material.Metal, {collide = false, shadow = false})
-end
-
--- ---------- КРЕСЛА ----------
-local function makeSeat(kind, x, stripe, labelText)
-  local s = newPart(CFrame.new(x, 0.6, DZ), Vector3.new(2.6, 0.8, 2.6), Color3.fromRGB(40, 44, 54), Enum.Material.Fabric)
-  local back = newPart(CFrame.new(x, 2.5, DZ + 1.55), Vector3.new(2.6, 3.0, 0.5), Color3.fromRGB(48, 53, 66), Enum.Material.Fabric)
-  newPart(CFrame.new(x, 2.5, DZ + 1.28), Vector3.new(0.35, 2.4, 0.06), stripe, Enum.Material.Neon, {collide = false, shadow = false})
-
-  local bb = Instance.new("BillboardGui")
-  bb.Size = UDim2.new(0, 130, 0, 26)
-  bb.StudsOffset = Vector3.new(0, 3.0, 0)
-  bb.MaxDistance = 45
-  bb.AlwaysOnTop = false
-  bb.Parent = back
-  local tl = Instance.new("TextLabel")
-  tl.Size = UDim2.new(1, 0, 1, 0)
-  tl.BackgroundColor3 = Color3.fromRGB(8, 14, 10)
-  tl.BackgroundTransparency = 0.25
-  tl.TextColor3 = stripe
-  tl.Font = Enum.Font.GothamBold
-  tl.TextSize = 13
-  tl.Text = labelText
-  tl.Parent = bb
-  local uc = Instance.new("UICorner"); uc.CornerRadius = UDim.new(0, 8); uc.Parent = tl
-
-  local rec = {kind = kind, part = s, back = back, bb = bb}
-  table.insert(seats, rec)
-  return rec
-end
-local driverSeat = makeSeat("pilot", -2.4, C_GREEN, "ВОДИТЕЛЬ (руль)")
-local passSeat   = makeSeat("passenger", 2.4, C_GLASS, "ПАССАЖИР")
-
--- ---------- ТРАПЫ у дверей ----------
-local function ramp(sign)
-  local H = CFG.LAND_H
-  local run = 6.2
-  local theta = math.atan2(H, run)
-  local len = math.sqrt(H * H + run * run)
-  local cx = 13.4 + run / 2
-  local center = Vector3.new(sign * (cx - 0.2 * math.sin(theta)), -H / 2 - 0.2 * math.cos(theta), DZ)
-  newPart(CFrame.new(center) * CFrame.Angles(0, 0, -sign * theta), Vector3.new(len, 0.4, 5.6), C_HULL, Enum.Material.DiamondPlate)
-end
-ramp(1)
-ramp(-1)
-
--- ===================== ФИЗИКА / ПОЛЁТ =====================
-local rayParams = RaycastParams.new()
-rayParams.FilterType = Enum.RaycastFilterType.Exclude
-pcall(function() rayParams.RespectCanCollide = true end)
-
-local function groundY(p)
-  local ignore = {model}
-  if LP.Character then table.insert(ignore, LP.Character) end
-  rayParams.FilterDescendantsInstances = ignore
-  local r = Workspace:Raycast(p + Vector3.new(0, 4, 0), Vector3.new(0, -4000, 0), rayParams)
-  return r and r.Position.Y or nil
-end
-
-local function applyRoot()
-  local cf = CFrame.new(pos) * CFrame.Angles(0, yaw, 0) * CFrame.Angles(tiltP, 0, tiltR)
-  if cf ~= lastCF then
-    model:PivotTo(cf)
-    lastCF = cf
-  end
-  return cf
-end
-
-local function placeNearPlayer()
-  local hrp = getHRP()
-  if not hrp then return end
-  local look = hrp.CFrame.LookVector
-  local d = Vector3.new(look.X, 0, look.Z)
-  d = (d.Magnitude > 0.01) and d.Unit or Vector3.new(0, 0, -1)
-  local target = hrp.Position + d * CFG.SPAWN_DIST
-  local gy = groundY(target)
-  pos = Vector3.new(target.X, (gy or (hrp.Position.Y - 3)) + CFG.LAND_H, target.Z)
-  yaw = math.atan2(-d.Z, d.X)      -- левая сторона (дверь водителя) смотрит на тебя
-  tiltP, tiltR, vel = 0, 0, Vector3.zero
-  for _, m in ipairs(mechs) do resetMech(m) end
-  lastCF = nil
-end
-
-local function isInsideCabin()
-  local hrp = getHRP()
-  if not hrp or not lastCF then return false end
-  local rel = lastCF:PointToObjectSpace(hrp.Position)
-  local dx, dz = rel.X, rel.Z - DZ
-  return math.sqrt(dx * dx + dz * dz) < R - 0.6 and rel.Y > -1 and rel.Y < R
-end
-
--- ===================== ИНТЕРФЕЙС =====================
-local gui = Instance.new("ScreenGui")
-gui.Name = "SaucerX_GUI"
-gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = true
-gui.DisplayOrder = 50
-gui.Parent = LP:WaitForChild("PlayerGui")
-
-local function mkBtn(parent, text, w, h)
-  local b = Instance.new("TextButton")
-  b.Size = UDim2.new(0, w, 0, h)
-  b.BackgroundColor3 = Color3.fromRGB(14, 20, 16)
-  b.BackgroundTransparency = 0.12
-  b.TextColor3 = Color3.fromRGB(150, 255, 110)
-  b.Font = Enum.Font.GothamBold
-  b.TextSize = 14
-  b.Text = text
-  b.BorderSizePixel = 0
-  local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 10); c.Parent = b
-  local st = Instance.new("UIStroke")
-  st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-  st.Color = Color3.fromRGB(120, 255, 90)
-  st.Thickness = 1.5
-  st.Parent = b
-  b.Parent = parent
-  return b
-end
-
--- всплывающие подсказки
-local toastLabel = Instance.new("TextLabel")
-toastLabel.AnchorPoint = Vector2.new(0.5, 0)
-toastLabel.Position = UDim2.new(0.5, 0, 0, 56)
-toastLabel.Size = UDim2.new(0.86, 0, 0, 46)
-toastLabel.BackgroundColor3 = Color3.fromRGB(8, 14, 10)
-toastLabel.BackgroundTransparency = 1
-toastLabel.TextColor3 = Color3.fromRGB(160, 255, 120)
-toastLabel.TextTransparency = 1
-toastLabel.Font = Enum.Font.GothamMedium
-toastLabel.TextSize = 15
-toastLabel.TextWrapped = true
-toastLabel.Text = ""
-toastLabel.Parent = gui
-do
-  local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 12); c.Parent = toastLabel
-  local sc = Instance.new("UISizeConstraint"); sc.MaxSize = Vector2.new(520, 70); sc.Parent = toastLabel
-end
-
-local toastId = 0
-toast = function(text)
-  toastId = toastId + 1
-  local id = toastId
-  toastLabel.Text = text
-  toastLabel.BackgroundTransparency = 0.15
-  toastLabel.TextTransparency = 0
-  task.delay(3.2, function()
-    if id == toastId and toastLabel.Parent then
-      TweenService:Create(toastLabel, TweenInfo.new(0.5), {BackgroundTransparency = 1, TextTransparency = 1}):Play()
-    end
-  end)
-end
-
--- кнопки полёта (видны только водителю)
-local hud = Instance.new("Frame")
-hud.AnchorPoint = Vector2.new(1, 0.5)
-hud.Position = UDim2.new(1, -10, 0.42, 0)
-hud.Size = UDim2.new(0, 112, 0, 216)
-hud.BackgroundTransparency = 1
-hud.Visible = false
-hud.Parent = gui
-do
-  local lay = Instance.new("UIListLayout")
-  lay.Padding = UDim.new(0, 8)
-  lay.Parent = hud
-end
-local btnUp    = mkBtn(hud, "▲ ВВЕРХ", 112, 52)
-local btnDown  = mkBtn(hud, "▼ ВНИЗ", 112, 52)
-local btnSpeed = mkBtn(hud, "СКОРОСТЬ x1", 112, 44)
-local btnExit  = mkBtn(hud, "ВЫЙТИ", 112, 44)
-
-local function holdButton(btn, setter)
-  bind(btn.InputBegan, function(i)
-    if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then setter(true) end
-  end)
-  bind(btn.InputEnded, function(i)
-    if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then setter(false) end
-  end)
-end
-holdButton(btnUp, function(v) upHeld = v end)
-holdButton(btnDown, function(v) downHeld = v end)
-
-bind(btnSpeed.Activated, function()
-  speedMul = speedMul % 3 + 1
-  btnSpeed.Text = "СКОРОСТЬ x" .. speedMul
-end)
-bind(btnExit.Activated, function()
-  if sitSeat then standUp() end
+-- вектор движения от джойстика / клавиатуры (x вправо, z назад)
+local controls
+task.spawn(function()
+	local ok, res = pcall(function()
+		local ps = lp:WaitForChild("PlayerScripts", 5)
+		local pm = ps and ps:WaitForChild("PlayerModule", 5)
+		return pm and require(pm):GetControls()
+	end)
+	if ok then controls = res end
 end)
 
--- маленькое меню
-local menuBtn = mkBtn(gui, "SX", 44, 44)
-menuBtn.Position = UDim2.new(0, 10, 0.32, 0)
-local panel = Instance.new("Frame")
-panel.Position = UDim2.new(0, 62, 0.32, 0)
-panel.Size = UDim2.new(0, 204, 0, 146)
-panel.BackgroundColor3 = Color3.fromRGB(10, 16, 12)
-panel.BackgroundTransparency = 0.1
-panel.BorderSizePixel = 0
-panel.Visible = false
-panel.Parent = gui
-do
-  local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 12); c.Parent = panel
-  local p = Instance.new("UIPadding")
-  p.PaddingTop = UDim.new(0, 8); p.PaddingLeft = UDim.new(0, 10); p.PaddingRight = UDim.new(0, 10); p.PaddingBottom = UDim.new(0, 8)
-  p.Parent = panel
-  local l = Instance.new("UIListLayout"); l.Padding = UDim.new(0, 8); l.Parent = panel
+local function getMove()
+	if controls then
+		local ok, v = pcall(function() return controls:GetMoveVector() end)
+		if ok and typeof(v) == "Vector3" then return v end
+	end
+	local _, h = getChar()
+	local cam = Workspace.CurrentCamera
+	if h and cam then
+		local rel = cam.CFrame:VectorToObjectSpace(h.MoveDirection)
+		return Vector3.new(rel.X, 0, rel.Z)
+	end
+	return Vector3.zero
 end
-local btnCall = mkBtn(panel, "ПОДОГНАТЬ КО МНЕ", 184, 36)
-local btnKill = mkBtn(panel, "УБРАТЬ ТАРЕЛКУ", 184, 36)
-do
-  local hint = Instance.new("TextLabel")
-  hint.Size = UDim2.new(0, 184, 0, 40)
-  hint.BackgroundTransparency = 1
-  hint.TextColor3 = Color3.fromRGB(170, 200, 175)
-  hint.Font = Enum.Font.Gotham
-  hint.TextSize = 12
-  hint.TextWrapped = true
-  hint.Text = "Тап по двери, капоту или багажнику — открыть / закрыть."
-  hint.Parent = panel
+
+---------------------------------------------------------------------
+-- Анимация частей (двери / капот / багажник / колёса / штурвал)
+---------------------------------------------------------------------
+local groupXf = {}
+local function ease(t) return t * t * (3 - 2 * t) end
+
+local function applyAlpha(group, a)
+	local xf = groupXf[group]
+	local isDoor = (group == "doorL" or group == "doorR")
+	for _, e in ipairs(anim[group]) do
+		local w = e.w
+		if w and w.Parent then
+			if e.fn then w.C0 = e.fn(a) else w.C0 = xf(a) * e.closed end
+			if e.cc then
+				if isDoor then
+					-- пока дверь движется, не толкаем игрока; закрытая и открытая (трап) — твёрдые
+					e.part.CanCollide = (a <= 0.001 or a >= 0.999)
+				else
+					e.part.CanCollide = (a <= 0.001)
+				end
+			end
+		end
+	end
 end
-bind(menuBtn.Activated, function() panel.Visible = not panel.Visible end)
-bind(btnCall.Activated, function()
-  if sitSeat then toast("Сначала встань с кресла"); return end
-  placeNearPlayer()
-  toast("Тарелка подогнана к тебе")
+
+local function applySteer(a)
+	for _, e in ipairs(anim.steer) do
+		if e.w and e.w.Parent then e.w.C0 = groupXf.steer(a) * e.closed end
+	end
+end
+
+setGroup = function(group, open, instant)
+	state[group] = open
+	gen[group] = gen[group] + 1
+	local my = gen[group]
+	local from, to = alpha[group], open and 1 or 0
+	if instant or from == to then
+		alpha[group] = to
+		applyAlpha(group, to)
+		return
+	end
+	local dur = 0.9
+	if group == "hood" or group == "trunk" then dur = 0.7 end
+	if group == "gear" then dur = 0.8 end
+	task.spawn(function()
+		local t0 = os.clock()
+		while gen[group] == my and ship do
+			local k = math.clamp((os.clock() - t0) / dur, 0, 1)
+			alpha[group] = from + (to - from) * ease(k)
+			applyAlpha(group, alpha[group])
+			if k >= 1 then break end
+			RunService.Heartbeat:Wait()
+		end
+	end)
+end
+
+---------------------------------------------------------------------
+-- Строительство тарелки
+---------------------------------------------------------------------
+local DA, DB, DC, DE = 4.5, 8.0, 6.5, 0.75   -- полуоси купола и «квадратность» формы
+
+local function spow(v, e)
+	if v < 0 then return -((-v) ^ e) end
+	return v ^ e
+end
+
+-- точка на поверхности купола (th — угол вокруг, ph — от вершины)
+local function P(th, ph)
+	local s = math.sin(ph)
+	return Vector3.new(DA * s * spow(math.cos(th), DE), DB * math.cos(ph), DC * s * spow(math.sin(th), DE))
+end
+
+local function mk(name, size, color, mat, transp, shape)
+	local p = Instance.new("Part")
+	p.Name = name
+	if shape then p.Shape = shape end
+	p.Size = size
+	p.Color = color
+	p.Material = mat or Enum.Material.SmoothPlastic
+	p.Transparency = transp or 0
+	p.Anchored = false
+	p.CanCollide = false
+	p.CanTouch = false
+	p.Massless = true
+	p.CastShadow = false
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	return p
+end
+
+local function addHint(part, kind, textA, textB, group, offset)
+	if not part then return end
+	local bb = Instance.new("BillboardGui")
+	bb.Name = "SaucerHint"
+	bb.Size = UDim2.fromOffset(130, 26)
+	bb.StudsOffset = offset or Vector3.new(0, 1.5, 0)
+	bb.AlwaysOnTop = false
+	bb.LightInfluence = 0
+	bb.Active = false
+	pcall(function() bb.MaxDistance = 45 end)
+	bb.Adornee = part
+	bb.Parent = part
+	local lb = Instance.new("TextLabel")
+	lb.Size = UDim2.new(1, 0, 1, 0)
+	lb.BackgroundColor3 = Color3.fromRGB(13, 17, 25)
+	lb.BackgroundTransparency = 0.2
+	lb.BorderSizePixel = 0
+	lb.Font = Enum.Font.GothamBold
+	lb.TextSize = 13
+	lb.TextColor3 = Color3.fromRGB(255, 176, 30)
+	lb.Text = textA or ""
+	lb.Parent = bb
+	local cr = Instance.new("UICorner")
+	cr.CornerRadius = UDim.new(0, 8)
+	cr.Parent = lb
+	hints[#hints + 1] = { lb = lb, kind = kind, a = textA, b = textB, group = group }
+end
+
+local function buildShip(spawnCF)
+	ship = Instance.new("Model")
+	ship.Name = "SaucerX_Ship"
+
+	root = Instance.new("Part")
+	root.Name = "Root"
+	root.Size = Vector3.new(1, 1, 1)
+	root.Transparency = 1
+	root.Anchored = true
+	root.CanCollide = false
+	root.CanQuery = false
+	root.CanTouch = false
+	root.CFrame = spawnCF
+	root.Parent = ship
+	ship.PrimaryPart = root
+
+	clickActs, passThrough, hints = {}, {}, {}
+	lightList, lensList, flames = {}, {}, {}
+	for _, g in ipairs(GROUPS) do
+		gen[g] = gen[g] + 1
+		alpha[g] = 0
+		state[g] = false
+		anim[g] = {}
+	end
+	anim.steer = {}
+	wheelSpin, lastSpin, steerAng, lastSteer = 0, 0, 0, 0
+
+	local MET, NEON, FAB, GLS = Enum.Material.Metal, Enum.Material.Neon, Enum.Material.Fabric, Enum.Material.Glass
+	local CYL = Enum.PartType.Cylinder
+
+	-- добавить деталь: cf — положение относительно центра тарелки
+	-- o.group = группа анимации, o.collide = твёрдая, o.query = false (нажатия и лучи проходят),
+	-- o.act = действие по нажатию, o.pass = нажатие проходит сквозь деталь, o.fn = своя функция анимации
+	local function add(p, cf, o)
+		o = o or {}
+		p.CFrame = root.CFrame * cf
+		p.CanCollide = (o.collide == true)
+		p.CanQuery = (o.query ~= false)
+		local w = Instance.new("Weld")
+		w.Part0 = root
+		w.Part1 = p
+		w.C0 = cf
+		w.C1 = CFrame.new()
+		w.Parent = p
+		p.Parent = ship
+		if o.group then
+			anim[o.group][#anim[o.group] + 1] = { w = w, part = p, closed = cf, cc = (o.collide == true), fn = o.fn }
+		end
+		if o.act then clickActs[p] = o.act end
+		if o.pass then passThrough[p] = true end
+		return p
+	end
+
+	local function B(name, sx, sy, sz, x, y, z, color, mat, o)
+		return add(mk(name, Vector3.new(sx, sy, sz), color, mat), CFrame.new(x, y, z), o)
+	end
+
+	local function bar(a, b, thick, color, mat, group)
+		local d = b - a
+		local len = d.Magnitude
+		if len < 0.05 then return end
+		local mid = (a + b) / 2
+		add(mk("Rib", Vector3.new(thick, thick, len + 0.04), color, mat), CFrame.lookAt(mid, mid + d),
+			{ group = group, query = false })
+	end
+
+	local actL = { kind = "group", name = "doorL" }
+	local actR = { kind = "group", name = "doorR" }
+	local actHood = { kind = "group", name = "hood" }
+	local actTrunk = { kind = "group", name = "trunk" }
+	local actLight = { kind = "lights" }
+	local actSeatL = { kind = "seat", side = -1 }
+	local actSeatR = { kind = "seat", side = 1 }
+
+	-- угол открытия двери: трап должен дойти до земли
+	do
+		local top = P(0, math.rad(40))
+		local rel = Vector3.new(top.X - DA, top.Y, 0)
+		doorOpen = 2.1
+		local a = 1.6
+		while a <= 2.5 do
+			local v = CFrame.Angles(0, 0, -a) * rel
+			if v.Y <= -(REST_DOWN - 0.15) then doorOpen = a; break end
+			a = a + 0.02
+		end
+	end
+
+	-------------------------------------------------- Корпус
+	B("Floor", 9, 2.05, 23, 0, -1.025, 0, C.hull, MET, { collide = true })
+	B("Carpet", 8.4, 0.04, 13, 0, 0.02, 0, C.dark, nil, { query = false })
+	B("Skirt", 9.2, 0.5, 23.4, 0, -1.8, 0, C.hull2, nil, { query = false })
+	B("LedL", 0.12, 0.22, 20, -4.56, -1.0, 0, C.orange, NEON, { query = false })
+	B("LedR", 0.12, 0.22, 20, 4.56, -1.0, 0, C.orange, NEON, { query = false })
+	B("BumperF", 9.4, 0.9, 0.5, 0, -1.1, -11.7, C.dark, nil, { collide = true })
+	B("BumperR", 9.4, 0.9, 0.5, 0, -1.1, 11.7, C.dark, nil, { collide = true })
+
+	-------------------------------------------------- Подкапотный отсек
+	for _, s in ipairs({ -1, 1 }) do
+		B("HoodWall", 0.5, 1.5, 5.1, s * 4.25, 0.75, -9.05, C.hull, MET, { collide = true, act = actHood })
+		B("TrunkWall", 0.5, 1.5, 5.1, s * 4.25, 0.75, 9.05, C.hull, MET, { collide = true, act = actTrunk })
+	end
+	B("HoodFront", 9, 1.5, 0.5, 0, 0.75, -11.25, C.hull, MET, { collide = true, act = actHood })
+	B("HoodBulk", 8, 1.5, 0.4, 0, 0.75, -6.7, C.hull2, MET, { collide = true, act = actHood })
+	add(mk("Engine", Vector3.new(4, 1.6, 1.6), C.copper, MET, 0, CYL), CFrame.new(0, 0.8, -9.4), { act = actHood })
+	add(mk("PortalTube", Vector3.new(2, 0.9, 0.9), C.green, NEON, 0, CYL),
+		CFrame.new(-2.6, 1.0, -8.4) * CFrame.Angles(0, 0, math.pi / 2), { act = actHood })
+	B("Battery", 1.6, 1, 1.2, 2.6, 0.5, -8.3, C.silver, MET, { act = actHood })
+
+	-------------------------------------------------- Багажный отсек
+	B("TrunkFront", 8, 1.5, 0.4, 0, 0.75, 6.7, C.hull2, MET, { collide = true, act = actTrunk })
+	B("TrunkRear", 9, 1.5, 0.5, 0, 0.75, 11.25, C.hull, MET, { collide = true, act = actTrunk })
+	B("Crate", 2.4, 1.2, 2.0, 0.2, 0.6, 9.8, C.tape, FAB, { act = actTrunk })
+	add(mk("CanPink", Vector3.new(1.1, 0.8, 0.8), C.can, MET, 0, CYL),
+		CFrame.new(-2.6, 0.55, 9.3) * CFrame.Angles(0, 0, math.pi / 2), { act = actTrunk })
+	add(mk("CanSilver", Vector3.new(1.1, 0.8, 0.8), C.silver, MET, 0, CYL),
+		CFrame.new(-1.6, 0.55, 10.3) * CFrame.Angles(0, 0, math.pi / 2), { act = actTrunk })
+	add(mk("Bottle1", Vector3.new(1.7, 0.7, 0.7), C.bottle, GLS, 0.2, CYL),
+		CFrame.new(2.5, 0.85, 9.6) * CFrame.Angles(0, 0, math.pi / 2), { act = actTrunk })
+	add(mk("Bottle2", Vector3.new(1.7, 0.7, 0.7), C.bottle2, GLS, 0.2, CYL),
+		CFrame.new(3.2, 0.85, 10.4) * CFrame.Angles(0, 0, math.pi / 2), { act = actTrunk })
+
+	-------------------------------------------------- Капот и багажник (крышки)
+	local hoodLid = B("Hood", 9, 0.4, 5.0, 0, 1.7, -9.0, C.hull, MET, { group = "hood", collide = true, act = actHood })
+	B("HoodLedA", 0.25, 0.06, 4.4, -1.4, 1.93, -9.0, C.orange, NEON, { group = "hood", query = false })
+	B("HoodLedB", 0.25, 0.06, 4.4, 1.4, 1.93, -9.0, C.orange, NEON, { group = "hood", query = false })
+	B("HoodVent", 2.4, 0.06, 1.2, 0, 1.93, -8.0, C.black, nil, { group = "hood", query = false })
+	local trunkLid = B("Trunk", 9, 0.4, 5.0, 0, 1.7, 9.0, C.hull, MET, { group = "trunk", collide = true, act = actTrunk })
+	B("TrunkLedA", 0.25, 0.06, 4.4, -1.4, 1.93, 9.0, C.orange, NEON, { group = "trunk", query = false })
+	B("TrunkLedB", 0.25, 0.06, 4.4, 1.4, 1.93, 9.0, C.orange, NEON, { group = "trunk", query = false })
+	addHint(hoodLid, "group", "🔧 Капот: открыть", "🔧 Капот: закрыть", "hood", Vector3.new(0, 1.6, 0))
+	addHint(trunkLid, "group", "🧳 Багажник: открыть", "🧳 Багажник: закрыть", "trunk", Vector3.new(0, 1.6, 0))
+
+	-------------------------------------------------- Фары и задние огни
+	for _, s in ipairs({ -1, 1 }) do
+		B("LightHousing", 1.5, 1.0, 0.35, s * 3.2, 0.75, -11.6, C.hull2, MET, { collide = false })
+		local lens = B("Lens", 1.1, 0.7, 0.18, s * 3.2, 0.75, -11.82, C.lens, NEON, { act = actLight })
+		lensList[#lensList + 1] = lens
+		local function spot(angle, range, bright)
+			local sp = Instance.new("SpotLight")
+			sp.Face = Enum.NormalId.Front
+			sp.Angle = angle
+			sp.Range = range
+			sp.Brightness = bright
+			sp.Color = Color3.fromRGB(255, 244, 214)
+			sp.Shadows = false
+			sp.Parent = lens
+			lightList[#lightList + 1] = sp
+		end
+		spot(60, 70, 3)      -- ближний
+		spot(28, 140, 2)     -- дальний
+		B("TailLight", 1.1, 0.5, 0.15, s * 3.4, 0.9, 11.55, C.red, NEON, { query = false })
+	end
+
+	-------------------------------------------------- Реактивные капсулы (без светящегося синего пламени)
+	for _, s in ipairs({ -1, 1 }) do
+		add(mk("Pod", Vector3.new(1.5, 2.2, 2.2), C.hull2, MET, 0, CYL),
+			CFrame.new(s * 2.6, 0.2, 12.3) * CFrame.Angles(0, math.pi / 2, 0), { collide = false })
+		-- тёмное сопло вместо светящегося диска
+		add(mk("PodNozzle", Vector3.new(0.2, 1.7, 1.7), C.black, MET, 0, CYL),
+			CFrame.new(s * 2.6, 0.2, 13.1) * CFrame.Angles(0, math.pi / 2, 0), { query = false })
+	end
+
+	-------------------------------------------------- Колёса (убираются внутрь корпуса)
+	for _, s in ipairs({ -1, 1 }) do
+		for _, wz in ipairs({ -7.5, 7.5 }) do
+			local sx, z = s, wz
+			add(mk("Tire", Vector3.new(0.9, 2, 2), C.black, nil, 0, CYL), CFrame.new(sx * 4.65, -1.0, z), {
+				group = "gear",
+				fn = function(a) return CFrame.new(sx * (4.65 - 1.25 * a), -1.0, z) * CFrame.Angles(wheelSpin, 0, 0) end,
+			})
+			add(mk("WheelHub", Vector3.new(1.0, 1.1, 1.1), C.silver, MET, 0, CYL), CFrame.new(sx * 4.77, -1.0, z), {
+				group = "gear", query = false,
+				fn = function(a) return CFrame.new(sx * (4.77 - 1.25 * a), -1.0, z) * CFrame.Angles(wheelSpin, 0, 0) end,
+			})
+		end
+	end
+
+	-------------------------------------------------- Купол: твёрдые стеклянные панели
+	do
+		local N = 16
+		local dth = 2 * math.pi / N
+		local phis = { math.rad(90), math.rad(62), math.rad(40), math.rad(20) }
+		local function th(k) return (k - 0.5) * dth end
+
+		-- какая дверь занимает ячейку (i — сектор вокруг, j — ряд снизу). 0 и 1 ряд — дверь
+		local function doorOf(i, j)
+			i = i % N
+			if j == 0 or j == 1 then
+				if i == 15 or i == 0 or i == 1 then return "doorR" end
+				if i == 7 or i == 8 or i == 9 then return "doorL" end
+			end
+			return nil
+		end
+
+		for i = 0, N - 1 do
+			for j = 0, 2 do
+				local p00 = P(th(i), phis[j + 1])
+				local p10 = P(th(i + 1), phis[j + 1])
+				local p01 = P(th(i), phis[j + 2])
+				local p11 = P(th(i + 1), phis[j + 2])
+				local center = (p00 + p10 + p01 + p11) / 4
+				local w = math.max((p10 - p00).Magnitude, (p11 - p01).Magnitude) * 1.05
+				local h = math.max((p01 - p00).Magnitude, (p11 - p10).Magnitude) * 1.08
+				local xa = ((p10 - p00) + (p11 - p01)).Unit
+				local za = ((p01 - p00) + (p11 - p10)).Unit
+				local ya = xa:Cross(za).Unit
+				local cf = CFrame.fromMatrix(center, xa, ya)
+				local g = doorOf(i, j)
+				local panel = mk("Glass", Vector3.new(w, 0.25, h), C.glass, GLS, 0.55)
+				panel.Reflectance = 0.08
+				if g then
+					add(panel, cf, { group = g, collide = true, act = (g == "doorL") and actL or actR })
+				else
+					add(panel, cf, { collide = true, pass = true })
+				end
+			end
+		end
+
+		-- крышка купола
+		local topY = DB * math.cos(phis[4])
+		local rx, rz = DA * math.sin(phis[4]), DC * math.sin(phis[4])
+		local cap = mk("GlassCap", Vector3.new(rx * 2.1, 0.25, rz * 2.1), C.glass, GLS, 0.55)
+		add(cap, CFrame.new(0, topY, 0), { collide = true, pass = true })
+
+		-- вертикальные рёбра
+		for k = 0, N - 1 do
+			for j = 0, 2 do
+				local g = doorOf(k - 1, j) or doorOf(k, j)
+				bar(P(th(k), phis[j + 1]), P(th(k), phis[j + 2]), 0.22, C.hull2, nil, g)
+			end
+		end
+		-- кольца: оранжевая LED-лента у основания, рамка над дверью и у крыши
+		for i = 0, N - 1 do
+			bar(P(th(i), phis[1]), P(th(i + 1), phis[1]), 0.3, C.orange, NEON, doorOf(i, 0))
+			bar(P(th(i), phis[3]), P(th(i + 1), phis[3]), 0.22, C.hull2, nil, doorOf(i, 1))
+			bar(P(th(i), phis[4]), P(th(i + 1), phis[4]), 0.22, C.hull2, nil, nil)
+		end
+
+		-- ручки дверей (за них тоже можно тапнуть)
+		for _, d in ipairs({ { "doorR", 1 }, { "doorL", -1 } }) do
+			local g, s = d[1], d[2]
+			local hp = P(0, math.rad(62))
+			local n = Vector3.new(hp.X / (DA * DA), hp.Y / (DB * DB), 0).Unit
+			local hpos = hp + n * 0.38
+			local ang = math.atan2(n.Y, n.X)
+			local cf
+			if s > 0 then
+				cf = CFrame.new(hpos) * CFrame.Angles(0, 0, ang)
+			else
+				cf = CFrame.new(-hpos.X, hpos.Y, hpos.Z) * CFrame.Angles(0, 0, math.pi - ang)
+			end
+			local handle = add(mk("DoorHandle", Vector3.new(0.4, 0.4, 1.7), C.brass, MET), cf,
+				{ group = g, act = (s > 0) and actR or actL })
+			local nm = (s > 0) and "правая" or "левая"
+			addHint(handle, "group", "🚪 Открыть (" .. nm .. ")", "🚪 Закрыть (" .. nm .. ")", g, Vector3.new(0, 1.4, 0))
+		end
+	end
+
+	-------------------------------------------------- Салон: приборная панель, кресла, штурвал
+	B("Dash", 8.0, 1.4, 1.2, 0, 0.7, -3.0, C.hull2, nil, { collide = true })
+	B("Screen", 3.2, 0.05, 0.7, 0, 1.42, -3.0, Color3.fromRGB(34, 52, 60), nil, { query = false })
+	B("DashLed", 7.0, 0.1, 0.06, 0, 1.1, -2.38, C.orange, NEON, { query = false })
+	B("Column", 0.35, 1.8, 0.35, -SEAT_X, 2.1, -2.2, C.black, MET, { query = false })
+
+	local lamp = B("CabinLamp", 0.6, 0.1, 0.6, 0, 7.3, 0, Color3.fromRGB(255, 240, 210), NEON, { query = false })
+	local cl = Instance.new("PointLight")
+	cl.Range = 16
+	cl.Brightness = 0.9
+	cl.Color = Color3.fromRGB(255, 232, 200)
+	cl.Parent = lamp
+
+	for _, s in ipairs({ -1, 1 }) do
+		local act = (s < 0) and actSeatL or actSeatR
+		local x = s * SEAT_X
+		B("SeatBase", 2.2, 1.0, 2.4, x, 0.5, 0.8, C.seat, FAB, { collide = true, act = act })
+		B("SeatCushion", 2.0, 0.4, 2.2, x, 1.2, 0.8, C.cushion, FAB, { act = act })
+		local back = B("SeatBack", 2.2, 2.8, 0.5, x, 2.4, 2.1, C.seat, FAB, { collide = true, act = act })
+		B("Headrest", 1.6, 0.9, 0.5, x, 4.1, 2.0, C.cushion, FAB, { act = act })
+		if s < 0 then
+			addHint(back, "seat", "💺 За руль (пилот)", nil, nil, Vector3.new(0, 3.2, 0))
+		else
+			addHint(back, "seat", "💺 Пассажир (без полёта)", nil, nil, Vector3.new(0, 3.2, 0))
+		end
+	end
+
+	-- штурвал (поворачивается при манёврах)
+	do
+		local H = CFrame.new(-SEAT_X, 3.1, -1.7) * CFrame.Angles(math.rad(-25), 0, 0)
+		groupXf.steer = function(a) return H * CFrame.Angles(0, 0, a) * H:Inverse() end
+		for i = 0, 11 do
+			local t = i / 12 * 2 * math.pi
+			local lcf = CFrame.new(math.cos(t) * 0.85, math.sin(t) * 0.85, 0) * CFrame.Angles(0, 0, t + math.pi / 2)
+			add(mk("WheelRim", Vector3.new(0.5, 0.26, 0.26), C.black, MET), H * lcf, { group = "steer", query = false })
+		end
+		add(mk("Spoke", Vector3.new(1.7, 0.14, 0.14), C.black, MET), H, { group = "steer", query = false })
+		add(mk("Spoke", Vector3.new(1.7, 0.14, 0.14), C.black, MET), H * CFrame.Angles(0, 0, math.pi / 2), { group = "steer", query = false })
+		add(mk("WheelHubC", Vector3.new(0.5, 0.5, 0.2), C.orange, NEON), H, { group = "steer", query = false })
+	end
+
+	-------------------------------------------------- Готово
+	lastCF = root.CFrame
+	ship.Parent = Workspace
+	setLights(true)
+end
+
+---------------------------------------------------------------------
+-- Интерфейс
+---------------------------------------------------------------------
+local function buildGui()
+	gui = Instance.new("ScreenGui")
+	gui.Name = "SaucerXGui"
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = 50
+	local okp = pcall(function() gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+	if not okp or not gui.Parent then gui.Parent = lp:WaitForChild("PlayerGui") end
+
+	local function style(b, radius)
+		local cr = Instance.new("UICorner")
+		cr.CornerRadius = UDim.new(0, radius or 10)
+		cr.Parent = b
+		local st = Instance.new("UIStroke")
+		st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+		st.Color = Color3.fromRGB(255, 176, 30)
+		st.Thickness = 1.2
+		st.Transparency = 0.35
+		st.Parent = b
+	end
+
+	local function button(parent, text, w, h, cb)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.fromOffset(w, h)
+		b.BackgroundColor3 = Color3.fromRGB(16, 20, 30)
+		b.BackgroundTransparency = 0.12
+		b.TextColor3 = Color3.fromRGB(255, 190, 50)
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 13
+		b.Text = text
+		b.AutoButtonColor = true
+		b.Parent = parent
+		style(b, 10)
+		b.MouseButton1Click:Connect(cb)
+		return b
+	end
+
+	local col = Instance.new("Frame")
+	col.BackgroundTransparency = 1
+	col.AutomaticSize = Enum.AutomaticSize.XY
+	col.Size = UDim2.fromOffset(0, 0)
+	col.Position = UDim2.new(0, 10, 0.18, 0)
+	col.Parent = gui
+	local lay = Instance.new("UIListLayout")
+	lay.Padding = UDim.new(0, 6)
+	lay.SortOrder = Enum.SortOrder.LayoutOrder
+	lay.Parent = col
+
+	-- главная кнопка 🛸
+	local main = button(col, "🛸", 54, 54, function()
+		if not ship then
+			ui.create()
+		else
+			ui.collapsed = not ui.collapsed
+			refreshUI()
+		end
+	end)
+	main.TextSize = 26
+	main.LayoutOrder = 1
+	ui.main = main
+
+	local panel = Instance.new("Frame")
+	panel.BackgroundTransparency = 1
+	panel.AutomaticSize = Enum.AutomaticSize.XY
+	panel.Size = UDim2.fromOffset(0, 0)
+	panel.LayoutOrder = 2
+	panel.Visible = false
+	panel.Parent = col
+	local pl = Instance.new("UIListLayout")
+	pl.Padding = UDim.new(0, 6)
+	pl.SortOrder = Enum.SortOrder.LayoutOrder
+	pl.Parent = panel
+	ui.panel = panel
+
+	statusLabel = Instance.new("TextLabel")
+	statusLabel.Size = UDim2.fromOffset(200, 48)
+	statusLabel.BackgroundColor3 = Color3.fromRGB(13, 17, 25)
+	statusLabel.BackgroundTransparency = 0.15
+	statusLabel.TextColor3 = Color3.fromRGB(235, 240, 250)
+	statusLabel.Font = Enum.Font.Gotham
+	statusLabel.TextSize = 12
+	statusLabel.TextWrapped = true
+	statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+	statusLabel.TextYAlignment = Enum.TextYAlignment.Top
+	statusLabel.Text = lastMsg
+	statusLabel.LayoutOrder = 1
+	statusLabel.Parent = panel
+	style(statusLabel, 8)
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 6)
+	pad.PaddingTop = UDim.new(0, 4)
+	pad.PaddingRight = UDim.new(0, 6)
+	pad.Parent = statusLabel
+
+	hudLabel = Instance.new("TextLabel")
+	hudLabel.Size = UDim2.fromOffset(200, 22)
+	hudLabel.BackgroundColor3 = Color3.fromRGB(13, 17, 25)
+	hudLabel.BackgroundTransparency = 0.25
+	hudLabel.TextColor3 = Color3.fromRGB(110, 230, 255)
+	hudLabel.Font = Enum.Font.GothamBold
+	hudLabel.TextSize = 12
+	hudLabel.Text = "⚡ 0    ↑ 0"
+	hudLabel.LayoutOrder = 2
+	hudLabel.Parent = panel
+	style(hudLabel, 8)
+
+	local grid = Instance.new("Frame")
+	grid.BackgroundTransparency = 1
+	grid.Size = UDim2.fromOffset(200, 0)
+	grid.AutomaticSize = Enum.AutomaticSize.Y
+	grid.LayoutOrder = 3
+	grid.Parent = panel
+	local gl = Instance.new("UIGridLayout")
+	gl.CellSize = UDim2.fromOffset(97, 30)
+	gl.CellPadding = UDim2.fromOffset(6, 6)
+	gl.SortOrder = Enum.SortOrder.LayoutOrder
+	gl.Parent = grid
+
+	ui.btnLights = button(grid, "💡 Свет (L)", 97, 30, function() setLights(not state.lights); refreshUI() end)
+	ui.btnGear = button(grid, "⚙ Колёса (B)", 97, 30, function() ui.toggleGear() end)
+	ui.btnView = button(grid, "👁 Вид (V)", 97, 30, function() setFirstPerson(not state.fp); refreshUI() end)
+	ui.btnSeat = button(grid, "💺 Сесть (G)", 97, 30, function() ui.seatToggle() end)
+	ui.btnRemove = button(grid, "✖ Убрать", 97, 30, function() destroyShip() end)
+	for i, b in ipairs({ ui.btnLights, ui.btnGear, ui.btnView, ui.btnSeat, ui.btnRemove }) do b.LayoutOrder = i end
+
+	exitBtn = button(gui, "🚪 Выйти (G)", 150, 44, function() exitShip() end)
+	exitBtn.AnchorPoint = Vector2.new(0.5, 0)
+	exitBtn.Position = UDim2.new(0.5, 0, 0, 64)
+	exitBtn.TextSize = 15
+	exitBtn.Visible = false
+end
+
+refreshUI = function()
+	local has = ship ~= nil
+	if ui.panel then ui.panel.Visible = has and not ui.collapsed end
+	if exitBtn then exitBtn.Visible = has and state.seated end
+	if statusLabel then statusLabel.Text = lastMsg end
+	if ui.btnSeat then ui.btnSeat.Text = state.seated and "🚪 Выйти (G)" or "💺 Сесть (G)" end
+	if ui.btnLights then ui.btnLights.Text = state.lights and "💡 Свет: вкл" or "💡 Свет: выкл" end
+	if ui.btnView then ui.btnView.Text = state.fp and "👁 Из кабины" or "👁 Вид (V)" end
+	for _, h in ipairs(hints) do
+		if h.kind == "group" then
+			h.lb.Text = state[h.group] and h.b or h.a
+		end
+	end
+end
+
+---------------------------------------------------------------------
+-- Огни, пламя, вид
+---------------------------------------------------------------------
+setLights = function(on)
+	state.lights = on
+	for _, l in ipairs(lightList) do l.Enabled = on end
+	for _, lens in ipairs(lensList) do
+		lens.Material = on and Enum.Material.Neon or Enum.Material.SmoothPlastic
+		lens.Color = on and C.lens or Color3.fromRGB(150, 150, 140)
+	end
+end
+
+local function setFlames(p)
+	for _, f in ipairs(flames) do
+		f.pe.Rate = p * 90
+		f.pe.Enabled = p > 0.03
+		f.light.Brightness = p * 3
+		f.light.Enabled = p > 0.03
+	end
+end
+
+setFirstPerson = function(on)
+	state.fp = on
+	pcall(function()
+		lp.CameraMode = on and Enum.CameraMode.LockFirstPerson or Enum.CameraMode.Classic
+	end)
+end
+
+---------------------------------------------------------------------
+-- Посадка / выход
+---------------------------------------------------------------------
+local function insideCabin(r)
+	if not (root and root.Parent) then return false end
+	local p = root.CFrame:PointToObjectSpace(r.Position)
+	return math.abs(p.X) < 4.6 and math.abs(p.Z) < 7 and p.Y > -1 and p.Y < 9
+end
+
+enterShip = function(side)
+	if not ship then return end
+	local c, h, r = getChar()
+	if not (h and r) or h.Health <= 0 then return end
+	if not state.seated then
+		local cc = {}
+		for _, p in ipairs(c:GetDescendants()) do
+			if p:IsA("BasePart") then cc[p] = p.CanCollide end
+		end
+		saved = { ws = h.WalkSpeed, jp = h.JumpPower, jh = h.JumpHeight, ar = h.AutoRotate, cc = cc }
+	end
+	state.seated = true
+	seatSide = side
+	state.pilot = (side == -1)
+	h.WalkSpeed = 0
+	h.JumpPower = 0
+	h.JumpHeight = 0
+	h.AutoRotate = false
+	pcall(function() h:SetStateEnabled(Enum.HumanoidStateType.Jumping, false) end)
+	h.Sit = true
+	vel = Vector3.zero
+	-- при посадке двери закрываются
+	if state.doorL then setGroup("doorL", false) end
+	if state.doorR then setGroup("doorR", false) end
+	if state.pilot then
+		say("Ты за рулём. Джойстик / WASD — лететь, камера задаёт направление.")
+	else
+		say("Пассажирское место: ты просто сидишь, лететь отсюда нельзя. Хочешь управлять — тапни на левое кресло.")
+	end
+	refreshUI()
+end
+
+exitShip = function(noTeleport)
+	if not state.seated then return end
+	state.seated = false
+	state.pilot = false
+	local c, h, r = getChar()
+	if h and saved then
+		h.WalkSpeed = saved.ws
+		h.JumpPower = saved.jp
+		h.JumpHeight = saved.jh
+		h.AutoRotate = saved.ar
+		h.Sit = false
+		pcall(function() h:SetStateEnabled(Enum.HumanoidStateType.Jumping, true) end)
+	end
+	if saved and saved.cc then
+		for p, v in pairs(saved.cc) do
+			if p and p.Parent then p.CanCollide = v end
+		end
+	end
+	saved = nil
+	shake = 0
+	if h then h.CameraOffset = Vector3.zero end
+	if r and ship and root and root.Parent and not noTeleport then
+		local up = 3.4
+		if h then up = math.max(3.4, h.HipHeight + r.Size.Y / 2 + 0.7) end
+		r.CFrame = root.CFrame * CFrame.new(0, up, 0.6)
+		r.AssemblyLinearVelocity = Vector3.zero
+		r.AssemblyAngularVelocity = Vector3.zero
+	end
+	if h then pcall(function() h:ChangeState(Enum.HumanoidStateType.GettingUp) end) end
+	if ship and curAlt < 2.5 then
+		setGroup("doorL", true)
+		setGroup("doorR", true)
+		say("Ты вышел. Двери открыты — нажми на дверь, чтобы закрыть.")
+	else
+		say("Ты встал в салоне. Тарелка в воздухе — двери закрыты.")
+	end
+	refreshUI()
+end
+
+local function tryEnter(side)
+	if not ship then say("Сначала создай тарелку (кнопка 🛸)"); return end
+	local c, h, r = getChar()
+	if not (h and r) or h.Health <= 0 then return end
+	if state.seated and seatSide == side then return end
+	if not state.seated then
+		if (r.Position - root.Position).Magnitude > 45 then
+			say("Подойди ближе к тарелке")
+			refreshUI()
+			return
+		end
+		if not insideCabin(r) and alpha.doorL < 0.9 and alpha.doorR < 0.9 then
+			say("Сначала открой дверь — тапни на неё, потом зайди внутрь.")
+			refreshUI()
+			return
+		end
+	end
+	enterShip(side)
+end
+
+ui.seatToggle = function()
+	if state.seated then exitShip() else tryEnter(-1) end
+end
+
+ui.toggleGear = function()
+	if not ship then return end
+	if curAlt < 0.8 then
+		say("Колёса нельзя убрать, пока стоишь на земле")
+		return
+	end
+	state.gearAuto = false
+	setGroup("gear", not state.gear)
+	say(state.gear and "Колёса убраны" or "Колёса выпущены")
+	refreshUI()
+end
+
+---------------------------------------------------------------------
+-- Создание / удаление
+---------------------------------------------------------------------
+ui.create = function()
+	if ship then return end
+	local c, h, r = getChar()
+	if not r then say("Персонаж не найден"); return end
+	local look = r.CFrame.LookVector * Vector3.new(1, 0, 1)
+	if look.Magnitude < 0.1 then look = Vector3.new(0, 0, -1) end
+	look = look.Unit
+	local origin = r.Position + look * 26
+	local gy = groundY(Vector3.new(origin.X, r.Position.Y + 30, origin.Z), { c }) or (r.Position.Y - 3)
+	pos = Vector3.new(origin.X, gy + REST_DOWN, origin.Z)
+	local toPlayer = Vector3.new(r.Position.X - pos.X, 0, r.Position.Z - pos.Z)
+	local dirv = (toPlayer.Magnitude > 0.1) and toPlayer.Unit or -look
+	yaw = math.atan2(-dirv.X, -dirv.Z)   -- нос тарелки смотрит на игрока
+	pitch, roll, vel, yawRate = 0, 0, Vector3.zero, 0
+	flamePower, lastFlame = 0, -1
+	exclTimer = 0
+	state.gear, state.gearAuto = false, true
+	ui.collapsed = false
+	buildShip(CFrame.new(pos) * CFrame.Angles(0, yaw, 0))
+	say("Тарелка готова. Тапни на дверь — откроется. Зайди и тапни на левое кресло (пилот).")
+	refreshUI()
+end
+
+destroyShip = function()
+	if state.seated then exitShip(true) end
+	setFirstPerson(false)
+	for _, g in ipairs(GROUPS) do
+		gen[g] = gen[g] + 1
+		alpha[g] = 0
+		state[g] = false
+	end
+	if ship then pcall(function() ship:Destroy() end) end
+	ship, root = nil, nil
+	clickActs, passThrough, hints = {}, {}, {}
+	lightList, lensList, flames = {}, {}, {}
+	vel = Vector3.zero
+	say("Тарелка убрана. Нажми 🛸 чтобы создать")
+	refreshUI()
+end
+
+---------------------------------------------------------------------
+-- Нажатия на детали (тап по двери / капоту / багажнику / креслу / фаре)
+---------------------------------------------------------------------
+local GROUP_TEXT = {
+	doorL = { "Левая дверь открыта", "Левая дверь закрыта" },
+	doorR = { "Правая дверь открыта", "Правая дверь закрыта" },
+	hood  = { "Капот открыт", "Капот закрыт" },
+	trunk = { "Багажник открыт", "Багажник закрыт" },
+}
+
+local function pickAct(sp)
+	local cam = Workspace.CurrentCamera
+	if not cam or not ship then return nil end
+	local ray = cam:ScreenPointToRay(sp.X, sp.Y)
+	local ex = { lp.Character }
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	for _ = 1, 14 do
+		params.FilterDescendantsInstances = ex
+		local res = Workspace:Raycast(ray.Origin, ray.Direction * 400, params)
+		if not res then return nil end
+		local part = res.Instance
+		local act = clickActs[part]
+		if act then return act end
+		if passThrough[part] then
+			ex[#ex + 1] = part      -- стекло: нажатие проходит насквозь к двери / креслу
+		else
+			return nil
+		end
+	end
+	return nil
+end
+
+local function handleTap(sp)
+	local act = pickAct(sp)
+	if not act then return end
+	if act.kind == "group" then
+		setGroup(act.name, not state[act.name])
+		say(GROUP_TEXT[act.name][state[act.name] and 1 or 2])
+	elseif act.kind == "seat" then
+		tryEnter(act.side)
+	elseif act.kind == "lights" then
+		setLights(not state.lights)
+		say(state.lights and "Фары включены" or "Фары выключены")
+	end
+	refreshUI()
+end
+
+local downs = {}
+connect(UIS.InputBegan, function(input, gpe)
+	local t = input.UserInputType
+	if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
+		if not gpe then
+			local key = (t == Enum.UserInputType.Touch) and input or "mouse"
+			downs[key] = { pos = Vector2.new(input.Position.X, input.Position.Y), t = os.clock() }
+		end
+		return
+	end
+	if gpe or t ~= Enum.UserInputType.Keyboard then return end
+	local k = input.KeyCode
+	if k == Enum.KeyCode.G then
+		if ship then ui.seatToggle() end
+	elseif k == Enum.KeyCode.L then
+		if ship then setLights(not state.lights); refreshUI() end
+	elseif k == Enum.KeyCode.V then
+		if ship then setFirstPerson(not state.fp); refreshUI() end
+	elseif k == Enum.KeyCode.B then
+		ui.toggleGear()
+	end
 end)
 
--- ===================== САДИМСЯ / ВСТАЁМ =====================
-sitOn = function(s)
-  local hum, hrp = getHum(), getHRP()
-  if sitSeat or not hum or not hrp or hum.Health <= 0 then return end
-  local w = Instance.new("Weld")
-  w.Name = "SaucerSeatWeld"
-  w.Part0 = s.part
-  w.Part1 = hrp
-  w.C0 = CFrame.new(0, s.part.Size.Y / 2 + 1.05, 0)
-  w.Parent = s.part
-  hrp.AssemblyLinearVelocity = Vector3.zero
-  hum.Sit = true
-  sitSeat, sitWeld, sitTime = s, w, os.clock()
-end
-
-standUp = function()
-  local hum, hrp = getHum(), getHRP()
-  local s = sitSeat
-  if sitWeld then pcall(function() sitWeld:Destroy() end) end
-  sitWeld, sitSeat = nil, nil
-  lastExit = os.clock()
-  if hum then hum.Sit = false end
-  if hum and hrp and hum.Health > 0 and s and s.part and s.part.Parent then
-    hrp.CFrame = s.part.CFrame * CFrame.new(0, s.part.Size.Y / 2 + 3.2, -1.2)
-    hrp.AssemblyLinearVelocity = Vector3.zero
-  end
-end
-
--- тап по креслу = сесть (только если ты уже внутри кабины)
-for _, s in ipairs(seats) do
-  local function tapSeat()
-    if sitSeat or os.clock() - lastExit < 0.3 then return end
-    if not isInsideCabin() then
-      toast("Сначала зайди внутрь через дверь")
-      return
-    end
-    sitOn(s)
-  end
-  interact[s.part] = {fn = tapSeat, range = 14}
-  interact[s.back] = {fn = tapSeat, range = 14}
-end
-
-local function onModeChanged(old, new)
-  hud.Visible = (new == "pilot")
-  for _, s in ipairs(seats) do s.bb.Enabled = (sitSeat ~= s) end
-  if new == "pilot" then
-    autoClosed = false
-    toast("Ты за рулём. Стик — лететь, ▲ ▼ — вверх и вниз.")
-  elseif new == "passenger" then
-    toast("Ты пассажир: тут только сидишь. Чтобы лететь, садись в левое кресло с рулём.")
-  elseif old ~= "none" then
-    upHeld, downHeld = false, false
-  end
-end
-
--- ===================== ГЛАВНЫЙ ЦИКЛ =====================
-local function step(dt)
-  if not model.Parent then return end
-  dt = math.min(dt, 0.1)
-  local hum, hrp = getHum(), getHRP()
-
-  -- всё ещё сидим?
-  if sitSeat then
-    local bad = (not hum) or (not hrp) or hum.Health <= 0 or (not sitWeld) or (not sitWeld.Parent) or sitWeld.Part1 ~= hrp
-    if not bad then
-      if os.clock() - sitTime < 0.5 then
-        hum.Sit = true
-      elseif not hum.Sit then
-        bad = true            -- нажал прыжок — вышел
-      end
-    end
-    if bad then standUp() end
-  end
-
-  -- сам садишься: упёрся в кресло, идя к нему
-  if not sitSeat and hum and hrp and hum.Health > 0 and (os.clock() - lastExit) > 1.2 then
-    local md = hum.MoveDirection
-    if md.Magnitude > 0.1 then
-      for _, s in ipairs(seats) do
-        local rel = s.part.CFrame:PointToObjectSpace(hrp.Position)
-        if math.abs(rel.X) < 2.8 and math.abs(rel.Z) < 2.8 and rel.Y > 0.3 and rel.Y < 4.5 then
-          local to = s.part.Position - hrp.Position
-          to = Vector3.new(to.X, 0, to.Z)
-          if to.Magnitude > 0.1 and md.Unit:Dot(to.Unit) > 0.35 then
-            sitOn(s)
-            break
-          end
-        end
-      end
-    end
-  end
-
-  local newMode = sitSeat and sitSeat.kind or "none"
-  if newMode ~= mode then
-    local old = mode
-    mode = newMode
-    onModeChanged(old, newMode)
-  end
-
-  local maxV = CFG.SPEED * speedMul
-
-  if mode == "pilot" and hum then
-    -- ЛЕТАЕТ ТОЛЬКО ВОДИТЕЛЬ
-    local mv = hum.MoveDirection
-    local mag = math.min(mv.Magnitude, 1)
-    local typing = UIS:GetFocusedTextBox() ~= nil
-    local up = upHeld or ((not typing) and UIS:IsKeyDown(Enum.KeyCode.E))
-    local down = downHeld or ((not typing) and UIS:IsKeyDown(Enum.KeyCode.Q))
-    local vy = (up and 1 or 0) - (down and 1 or 0)
-
-    local desired = Vector3.zero
-    if mag > 0.05 then desired = mv.Unit * mag * maxV end
-    desired = desired + Vector3.new(0, vy * CFG.VSPEED * (0.6 + 0.4 * speedMul), 0)
-
-    if (mag > 0.1 or vy ~= 0) and not autoClosed then
-      autoClosed = true
-      if closeAll() > 0 then toast("Всё закрылось — поехали!") end
-    end
-
-    vel = vel:Lerp(desired, 1 - math.exp(-dt * 3.2))
-    if mag > 0.15 then
-      local target = math.atan2(-mv.X, -mv.Z)
-      yaw = yaw + wrapAngle(target - yaw) * (1 - math.exp(-dt * CFG.TURN))
-    end
-    pos = pos + vel * dt
-
-    local lv = CFrame.Angles(0, yaw, 0):VectorToObjectSpace(vel)
-    local tp = math.clamp(lv.Z / maxV * 0.2, -0.3, 0.3)
-    local tr = math.clamp(-lv.X / maxV * 0.25, -0.35, 0.35)
-    local k = 1 - math.exp(-dt * 5)
-    tiltP = tiltP + (tp - tiltP) * k
-    tiltR = tiltR + (tr - tiltR) * k
-
-    local gy = groundY(pos)
-    if gy then
-      local minY = gy + CFG.LAND_H
-      if pos.Y < minY then
-        pos = Vector3.new(pos.X, minY, pos.Z)
-        if vel.Y < 0 then vel = Vector3.new(vel.X, 0, vel.Z) end
-      end
-    end
-  else
-    -- водителя нет (или ты пассажир): тормозим и плавно садимся
-    vel = vel:Lerp(Vector3.zero, 1 - math.exp(-dt * 4))
-    pos = pos + vel * dt
-    local k = 1 - math.exp(-dt * 4)
-    tiltP = tiltP * (1 - k)
-    tiltR = tiltR * (1 - k)
-    local gy = groundY(pos)
-    if gy then
-      local minY = gy + CFG.LAND_H
-      if pos.Y > minY + 0.03 then
-        local d = pos.Y - minY
-        local fall = math.min(d, math.min(14, 2 + d * 0.7) * dt)
-        pos = Vector3.new(pos.X, pos.Y - fall, pos.Z)
-      elseif pos.Y < minY then
-        pos = Vector3.new(pos.X, minY, pos.Z)
-      end
-    end
-  end
-
-  local rootCF = applyRoot()
-  for _, m in ipairs(mechs) do stepMech(m, dt, rootCF) end
-end
-
--- ===================== ТАП ПО ДВЕРЯМ / КАПОТУ / БАГАЖНИКУ =====================
-local lastTap = 0
-
-local function castTap(ray)
-  local ignore = {}
-  if LP.Character then table.insert(ignore, LP.Character) end
-  local params = RaycastParams.new()
-  params.FilterType = Enum.RaycastFilterType.Exclude
-  for _ = 1, 10 do
-    params.FilterDescendantsInstances = ignore
-    local res = Workspace:Raycast(ray.Origin, ray.Direction * 600, params)
-    if not res then return false end
-    local p = res.Instance
-    local it = interact[p]
-    if it then
-      local hrp = getHRP()
-      if hrp and (hrp.Position - res.Position).Magnitude > it.range then
-        toast("Подойди ближе")
-      else
-        it.fn()
-      end
-      return true
-    end
-    if glassSet[p] then
-      table.insert(ignore, p)      -- тап проходит сквозь стекло (только тап, пройти сквозь него нельзя)
-    else
-      return false
-    end
-  end
-  return false
-end
-
-local function handleTap(p2, viewportFirst)
-  if os.clock() - lastTap < 0.25 then return end
-  local cam = Workspace.CurrentCamera
-  if not cam then return end
-  local a, b
-  if viewportFirst then
-    a, b = cam:ViewportPointToRay(p2.X, p2.Y), cam:ScreenPointToRay(p2.X, p2.Y)
-  else
-    a, b = cam:ScreenPointToRay(p2.X, p2.Y), cam:ViewportPointToRay(p2.X, p2.Y)
-  end
-  if castTap(a) or castTap(b) then lastTap = os.clock() end
-end
-
-bind(UIS.InputBegan, function(input, gp)
-  if gp then return end
-  if input.UserInputType == Enum.UserInputType.MouseButton1 then
-    handleTap(UIS:GetMouseLocation(), true)
-  end
-end)
-bind(UIS.TouchTapInWorld, function(p, processed)
-  if processed then return end
-  handleTap(p, false)
+connect(UIS.InputEnded, function(input)
+	local t = input.UserInputType
+	if t ~= Enum.UserInputType.MouseButton1 and t ~= Enum.UserInputType.Touch then return end
+	local key = (t == Enum.UserInputType.Touch) and input or "mouse"
+	local d = downs[key]
+	if not d then return end
+	downs[key] = nil
+	if not ship then return end
+	local p = Vector2.new(input.Position.X, input.Position.Y)
+	if (p - d.pos).Magnitude < 16 and (os.clock() - d.t) < 0.6 then
+		handleTap(p)
+	end
 end)
 
--- ===================== УБОРКА =====================
-cleanup = function()
-  if sitSeat then pcall(standUp) end
-  for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
-  conns = {}
-  pcall(function() model:Destroy() end)
-  pcall(function() gui:Destroy() end)
-  ENV.SaucerX_Cleanup = nil
-end
-ENV.SaucerX_Cleanup = cleanup
-bind(btnKill.Activated, function() cleanup() end)
+connect(UIS.JumpRequest, function() jumpT = os.clock() end)
 
--- ===================== СТАРТ =====================
-placeNearPlayer()
-applyRoot()
-model.Parent = Workspace
-bind(RunService.Stepped, function(_, dt) step(dt) end)
-toast("SAUCER-X v7 готов. Тапни по левой двери — это место водителя (там руль).")
+---------------------------------------------------------------------
+-- Главный цикл
+---------------------------------------------------------------------
+---------------------------------------------------------------------
+-- Столкновения: тарелка упирается в стены и препятствия, а не пролетает сквозь них
+---------------------------------------------------------------------
+local CRASH_DAMAGE = 0      -- урон персонажу от сильного удара (0 = без урона, например 30 = ощутимо)
+local HIT_MARGIN = 0.12
+
+local hasBlockcast = pcall(function() return Workspace.Blockcast end)
+local castParams = RaycastParams.new()
+castParams.FilterType = Enum.RaycastFilterType.Exclude
+castParams.IgnoreWater = true
+pcall(function() castParams.RespectCanCollide = true end)
+local overlapParams = OverlapParams.new()
+overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+pcall(function() overlapParams.RespectCanCollide = true end)
+
+-- форма тарелки для проверки: низкий длинный корпус + узкий купол сверху
+local BOXES = {
+	{ off = CFrame.new(0, 0.5, 0), size = Vector3.new(9.2, 3, 23) },
+	{ off = CFrame.new(0, 5.0, 0), size = Vector3.new(8.6, 6, 12.6) },
+}
+
+local function refreshExclude()
+	local t = { ship }
+	for _, pl in ipairs(Players:GetPlayers()) do
+		if pl.Character then t[#t + 1] = pl.Character end
+	end
+	excl = t
+	castParams.FilterDescendantsInstances = t
+	overlapParams.FilterDescendantsInstances = t
+end
+
+-- протянуть блок по направлению dir, вернуть первое препятствие
+local function sweepBox(base, boxOff, size, dir)
+	local from = base * boxOff
+	if hasBlockcast then
+		local ok, res = pcall(function() return Workspace:Blockcast(from, size, dir, castParams) end)
+		if ok then return res end
+	end
+	-- запасной вариант: лучи из углов и середин блока
+	local best
+	local hx, hy, hz = size.X / 2, size.Y / 2, size.Z / 2
+	for _, sx in ipairs({ -1, 0, 1 }) do
+		for _, sy in ipairs({ -1, 1 }) do
+			for _, sz in ipairs({ -1, 0, 1 }) do
+				local o = (from * CFrame.new(sx * hx, sy * hy, sz * hz)).Position
+				local r = Workspace:Raycast(o, dir, castParams)
+				if r and (not best or r.Distance < best.Distance) then best = r end
+			end
+		end
+	end
+	return best
+end
+
+-- последствия удара: тряска, толчок корпуса, сообщение, (по желанию) урон
+local function onImpact(impact, n, h)
+	local floorHit = n.Y > 0.7
+	if impact < (floorHit and 25 or 8) then return end
+	shake = math.max(shake, math.min(impact / 60, 1))
+	local lv = lastCF:VectorToObjectSpace(n)
+	local kick = math.min(impact / 70, 1) * 0.25
+	pitch = pitch + lv.Z * kick
+	roll = roll - lv.X * kick
+	if impact > 14 then say("💥 Удар!") end
+	if CRASH_DAMAGE > 0 and state.seated and h and impact > 30 then
+		h.Health = h.Health - CRASH_DAMAGE * math.min((impact - 30) / 40, 1)
+	end
+end
+
+-- сдвинуть тарелку; при столкновении остановиться, скользнуть вдоль стены и отскочить
+local function moveWithCollision(p, v, dt, yawv, h)
+	local d = v * dt
+	local rot = CFrame.Angles(0, yawv, 0)
+	for _ = 1, 3 do
+		if d.Magnitude < 1e-4 then break end
+		local base = CFrame.new(p) * rot
+		local hit, hitDist
+		for _, bx in ipairs(BOXES) do
+			local res = sweepBox(base, bx.off, bx.size, d)
+			if res and (not hit or res.Distance < hitDist) then hit, hitDist = res, res.Distance end
+		end
+		if not hit then
+			p = p + d
+			break
+		end
+		if hitDist < 0.02 then
+			-- если мы уже внутри чего-то, даём выбраться, а не замираем навсегда
+			local inside = false
+			for _, bx in ipairs(BOXES) do
+				local parts = Workspace:GetPartBoundsInBox(base * bx.off, bx.size, overlapParams)
+				if #parts > 0 then inside = true; break end
+			end
+			if inside then
+				p = p + d
+				break
+			end
+		end
+		local n = hit.Normal
+		local dir = d.Unit
+		local adv = math.max(hitDist - HIT_MARGIN, 0)
+		p = p + dir * adv
+		local vn = v:Dot(n)
+		if vn < 0 then
+			local impact = -vn
+			v = v - n * vn                       -- скользим вдоль поверхности
+			onImpact(impact, n, h)
+			if impact > 12 and n.Y < 0.7 then
+				v = v + n * impact * 0.3         -- отскок от стены
+			end
+		end
+		local rem = d - dir * adv
+		d = rem - n * rem:Dot(n)
+	end
+	return p, v
+end
+
+local function update(dt)
+	if not ship or not root or not root.Parent then return end
+	if dt > 0.05 then dt = 0.05 end
+	if dt <= 0 then return end
+
+	local c, h, r = getChar()
+	if state.seated and (not h or not r or h.Health <= 0) then exitShip(true) end
+
+	local cam = Workspace.CurrentCamera
+	-- лететь может только пилот (левое кресло); пассажир просто сидит
+	local flying = state.seated and state.pilot
+	local target = Vector3.zero
+	local active = false
+
+	if flying and cam then
+		local typing = UIS:GetFocusedTextBox() ~= nil
+		local mv = getMove()
+		local fwd, str = -mv.Z, mv.X
+		local upIn = 0
+		if not typing then
+			if UIS:IsKeyDown(Enum.KeyCode.Space) then upIn = upIn + 1 end
+			if UIS:IsKeyDown(Enum.KeyCode.LeftControl) or UIS:IsKeyDown(Enum.KeyCode.Q) then upIn = upIn - 1 end
+		end
+		if (os.clock() - jumpT) < 0.25 or (h and h.Jump) then upIn = math.max(upIn, 1) end
+		local cl, cr = cam.CFrame.LookVector, cam.CFrame.RightVector
+		local wish = cl * fwd + cr * str + Vector3.new(0, upIn, 0)
+		if wish.Magnitude > 1 then wish = wish.Unit end
+		active = wish.Magnitude > 0.05
+		local boost = 1
+		if not typing and (UIS:IsKeyDown(Enum.KeyCode.LeftShift) or UIS:IsKeyDown(Enum.KeyCode.RightShift)) then boost = 2 end
+		target = wish * speed * boost
+		local hl = Vector3.new(cl.X, 0, cl.Z)
+		if hl.Magnitude > 0.2 then camYaw = math.atan2(-hl.X, -hl.Z) end
+	end
+
+	vel = vel:Lerp(target, 1 - math.exp(-dt * (flying and 2.2 or 3)))
+	if not flying and vel.Magnitude < 0.02 then vel = Vector3.zero end
+	exclTimer = exclTimer - dt
+	if exclTimer <= 0 then
+		exclTimer = 0.5
+		refreshExclude()
+	end
+	if vel.Magnitude > 0.01 then
+		pos, vel = moveWithCollision(pos, vel, dt, yaw, h)
+	end
+
+	-- земля под тарелкой
+	local gy = groundY(Vector3.new(pos.X, pos.Y + 3, pos.Z), excl)
+	local rest = REST_DOWN + (REST_UP - REST_DOWN) * alpha.gear
+	local alt = 999
+	if gy then
+		local minY = gy + rest
+		-- смотрим землю ещё спереди, сзади и по бокам: тарелка плавно едет по склонам,
+		-- а высокие ступени и стены (выше ~2.5) считаются препятствием
+		local fh = Vector3.new(-math.sin(yaw), 0, -math.cos(yaw))
+		local rh = Vector3.new(math.cos(yaw), 0, -math.sin(yaw))
+		for _, off in ipairs({ fh * 9, -fh * 9, rh * 3.8, -rh * 3.8 }) do
+			local g2 = groundY(Vector3.new(pos.X + off.X, pos.Y + 3, pos.Z + off.Z), excl)
+			if g2 and (g2 - gy) <= 2.5 and (g2 + rest) > minY then minY = g2 + rest end
+		end
+		alt = pos.Y - minY
+		if alt < 0 then
+			pos = Vector3.new(pos.X, minY, pos.Z)
+			alt = 0
+			if vel.Y < 0 then vel = Vector3.new(vel.X, 0, vel.Z) end
+		end
+	end
+	curAlt = alt
+
+	-- колёса: сами убираются в полёте и выпускаются у земли
+	if alt < 0.6 then
+		state.gearAuto = true
+		if state.gear then setGroup("gear", false) end
+	elseif state.gearAuto and flying then
+		local want = alt > 7
+		if want ~= state.gear then setGroup("gear", want) end
+	end
+
+	-- поворот носом в сторону камеры
+	local oldYaw = yaw
+	if flying and active then
+		local d = (camYaw - yaw + math.pi) % (2 * math.pi) - math.pi
+		yaw = yaw + d * (1 - math.exp(-dt * 2.6))
+	end
+	yawRate = (yaw - oldYaw) / dt
+
+	local fwdH = Vector3.new(-math.sin(yaw), 0, -math.cos(yaw))
+	local rightH = Vector3.new(math.cos(yaw), 0, -math.sin(yaw))
+	local fv = vel:Dot(fwdH) / (speed * 2)
+	local sv = vel:Dot(rightH) / (speed * 2)
+	local tp = -fv * 0.45 + (vel.Y / (speed * 2)) * 0.3
+	local tr = math.clamp(yawRate * 0.15, -0.5, 0.5) - sv * 0.35
+	local k = 1 - math.exp(-dt * 4)
+	pitch = pitch + (tp - pitch) * k
+	roll = roll + (tr - roll) * k
+
+	-- лёгкое покачивание в воздухе
+	local bob = 0
+	if alt > 0.5 then bob = math.sin(os.clock() * 1.7) * 0.12 * math.min(alt / 3, 1) end
+
+	local cf = CFrame.new(pos + Vector3.new(0, bob, 0)) * CFrame.Angles(0, yaw, 0) * CFrame.Angles(pitch, 0, roll)
+	if (cf.Position - lastCF.Position).Magnitude > 0.003
+		or (cf.LookVector - lastCF.LookVector).Magnitude > 0.0008
+		or (cf.RightVector - lastCF.RightVector).Magnitude > 0.0008 then
+		root.CFrame = cf
+		lastCF = cf
+	end
+
+	-- персонаж сидит в своём кресле и едет вместе с тарелкой
+	if state.seated and r then
+		r.CFrame = root.CFrame * CFrame.new(seatSide * SEAT_X, SEAT_TOP + SIT_OFF, 0.8)
+		r.AssemblyLinearVelocity = Vector3.zero
+		r.AssemblyAngularVelocity = Vector3.zero
+		if h and not h.Sit then h.Sit = true end
+	end
+
+	-- вращение колёс по земле
+	if alt < 0.6 and alpha.gear < 0.5 then
+		wheelSpin = wheelSpin - vel:Dot(fwdH) * dt / 1.0
+	end
+	if math.abs(wheelSpin - lastSpin) > 0.05 then
+		lastSpin = wheelSpin
+		applyAlpha("gear", alpha.gear)
+	end
+
+	-- штурвал
+	local st = 0
+	if flying then st = math.clamp(yawRate * 0.8, -1.2, 1.2) end
+	steerAng = steerAng + (st - steerAng) * (1 - math.exp(-dt * 6))
+	if math.abs(steerAng - lastSteer) > 0.02 then
+		lastSteer = steerAng
+		applySteer(steerAng)
+	end
+
+	-- тряска камеры после удара
+	if h then
+		if shake > 0.01 then
+			h.CameraOffset = Vector3.new(math.random() - 0.5, math.random() - 0.5, 0) * shake * 1.4
+			shake = shake * math.exp(-dt * 5)
+			shakeOn = true
+		elseif shakeOn then
+			h.CameraOffset = Vector3.zero
+			shakeOn = false
+			shake = 0
+		end
+	end
+
+	-- HUD
+	hudTimer = hudTimer + dt
+	if hudTimer > 0.15 then
+		hudTimer = 0
+		if hudLabel then
+			hudLabel.Text = string.format("⚡ %d    ↑ %d", math.floor(vel.Magnitude + 0.5), math.floor(math.min(alt, 9999) + 0.5))
+		end
+	end
+end
+
+-- пока персонаж сидит, он не сталкивается с тарелкой
+connect(RunService.Stepped, function()
+	if state.seated and saved and saved.cc then
+		for p in pairs(saved.cc) do
+			if p and p.Parent then p.CanCollide = false end
+		end
+	end
+end)
+
+connect(lp.CharacterAdded, function()
+	if state.seated then
+		state.seated = false
+		state.pilot = false
+		saved = nil
+		refreshUI()
+	end
+end)
+
+pcall(function() RunService:UnbindFromRenderStep("SaucerX_Update") end)
+RunService:BindToRenderStep("SaucerX_Update", Enum.RenderPriority.Camera.Value - 1, update)
+
+buildGui()
+refreshUI()
+
+env.__SaucerX = function()
+	pcall(function() RunService:UnbindFromRenderStep("SaucerX_Update") end)
+	pcall(destroyShip)
+	for _, cn in ipairs(connections) do pcall(function() cn:Disconnect() end) end
+	if gui then pcall(function() gui:Destroy() end) end
+	env.__SaucerX = nil
+end
