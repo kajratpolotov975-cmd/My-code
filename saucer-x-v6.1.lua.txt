@@ -1,0 +1,1024 @@
+--[[
+  SAUCER-X v6.1 — патч-загрузчик (Delta / Roblox)
+  Скачивает оригинальный saucer-x-v6, патчит его и запускает.
+
+  ЧТО ИСПРАВЛЕНО:
+  1) Купол / стёкла / рамки теперь ТВЁРДЫЕ (сквозь них не пройти).
+     Нажатия проходят сквозь стекло, поэтому креслами, дверями и рулём внутри можно пользоваться.
+  2) Пассажирское кресло (правое): полёт заблокирован, просто сидишь. Летает только пилот (левое).
+  3) Двери, капот и багажник: тап = открыть, ещё тап = закрыть.
+     Подписи "Открыть / Закрыть" над деталями убраны.
+  4) СТОЛКНОВЕНИЯ: стены и препятствия останавливают тарелку, она отскакивает,
+     камера трясётся ("💥 Удар!"). Выключить: COLLIDE = false. Сила отскока: BOUNCE.
+  5) Синее СВЕЧЕНИЕ убрано (синие источники света и bloom). Синий огонь орудий остался.
+  6) АВТОПИЛОТ: кнопка "🧭 Автопилот" справа сверху. После включения открывается карта сервера
+     в правом углу. Тапни на карту: тарелка сама полетит туда, карта свернётся. По пути облетает
+     препятствия (сбоку или сверху). Кнопка ещё раз = стоп. Любое ручное управление тоже отключает.
+]]
+
+local SRC_URL = "https://raw.githubusercontent.com/kajratpolotov975-cmd/Bomb/refs/heads/main/saucer-x-v6.lua.txt"
+
+local Players    = game:GetService("Players")
+local UIS        = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Workspace  = game:GetService("Workspace")
+local lp         = Players.LocalPlayer
+local env        = (getgenv and getgenv()) or _G
+
+-- убрать прошлый запуск патча
+if env.__SXPatchCleanup then pcall(env.__SXPatchCleanup) end
+
+local conns = {}
+local function track(c) conns[#conns + 1] = c return c end
+env.__SXPatchCleanup = function()
+	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	conns = {}
+	pcall(function() RunService:UnbindFromRenderStep("SXNoGlow") end)
+	env.__SXAuto, env.__SXAutoManual = false, nil
+	if env.__SXGui then pcall(function() env.__SXGui:Destroy() end) env.__SXGui = nil end
+	env.__SXKey, env.__SXMove, env.__SXMoveVec, env.__SXJump = nil, nil, nil, nil
+end
+
+---------------------------------------------------------------------
+-- 1. Скачиваем оригинал
+---------------------------------------------------------------------
+local okGet, src = pcall(function() return game:HttpGet(SRC_URL) end)
+if not okGet or type(src) ~= "string" or #src < 1000 then
+	warn("[SaucerX+] Не удалось скачать оригинальный скрипт: " .. tostring(src))
+	return
+end
+
+---------------------------------------------------------------------
+-- 2. Патчи исходного кода
+---------------------------------------------------------------------
+local function replacePlain(s, a, b)
+	local i, j = string.find(s, a, 1, true)
+	if not i then return s, false end
+	return s:sub(1, i - 1) .. b .. s:sub(j + 1), true
+end
+
+local patched = src
+
+-- 2.1 setGroup делаем доступным снаружи (forward-объявление)
+do
+	local A1 = "local exitShip, enterShip, refreshUI, setLights, destroyShip, setFirstPerson, updateWheels"
+	local A2 = "local function setGroup(group, open, instant)"
+	if string.find(patched, A1, 1, true) and string.find(patched, A2, 1, true) then
+		patched = replacePlain(patched, A1, A1 .. ", setGroup")
+		patched = replacePlain(patched, A2, "function setGroup(group, open, instant)")
+	else
+		warn("[SaucerX+] setGroup не найден — тап-страховка может не работать")
+	end
+end
+
+-- 2.2 API для доступа к внутренностям (корабль, состояние, нажатия, кресло)
+do
+	local ANCHOR = "local function onClick(part, act)"
+	local API = [[
+env.__SXApi = {
+	state = state,
+	acts = clickActs,
+	setGroup = function(...) if setGroup then return setGroup(...) end end,
+	ship = function() return ship end,
+	beacon = function() return beacon end,
+	getPV = function() return pos, vel end,
+	setPV = function(p, v) pos = p if v ~= nil then vel = v end end,
+	say = say,
+	canFly = function()
+		if not state.seated then return true end
+		return not (seatSide > 0 or seatRel == SEAT_R)
+	end,
+}
+
+]]
+	local ok
+	patched, ok = replacePlain(patched, ANCHOR, API .. ANCHOR)
+	if not ok then warn("[SaucerX+] Не найден onClick — API недоступен") end
+end
+
+-- 2.3 убираем подписи "Открыть / Закрыть" над деталями
+do
+	local ok
+	patched, ok = replacePlain(patched, "bb.Parent = part", "bb.Parent = nil")
+	if not ok then warn("[SaucerX+] Подписи не найдены") end
+end
+
+-- 2.4 блокируем ввод полёта для пассажира
+patched = patched:gsub("[%w_]+:IsKeyDown%(([^%(%)]-)%)", function(a)
+	return "env.__SXKey(" .. a .. ")"
+end)
+patched = patched:gsub("([%w_%.]+)%.MoveDirection", function(o)
+	return "env.__SXMove(" .. o .. ")"
+end)
+patched = patched:gsub("([%w_%.]+):GetMoveVector%(%)", function(o)
+	return "env.__SXMoveVec(" .. o .. ")"
+end)
+for _, kw in ipairs({ "then", "and", "or" }) do
+	patched = patched:gsub("([%w_%.]+)%.Jump(%s+)" .. kw .. "%f[^%w_]", function(o, sp)
+		return "env.__SXJump(" .. o .. ")" .. sp .. kw
+	end)
+end
+
+---------------------------------------------------------------------
+-- 3. Функции-обёртки ввода
+---------------------------------------------------------------------
+local FLIGHT_KEYS = {}
+for _, n in ipairs({ "W", "A", "S", "D", "Q", "E", "Space", "LeftControl", "RightControl",
+	"LeftShift", "RightShift", "Up", "Down", "Left", "Right", "ButtonA", "ButtonX", "ButtonL2", "ButtonR2" }) do
+	local ok, kc = pcall(function() return Enum.KeyCode[n] end)
+	if ok and kc then FLIGHT_KEYS[kc] = true end
+end
+
+local lastNote = 0
+local function api() return env.__SXApi end
+
+local function canFly()
+	local a = api()
+	if not a then return true end
+	local ok, r = pcall(a.canFly)
+	if not ok then return true end
+	return r
+end
+
+local function note()
+	if tick() - lastNote < 4 then return end
+	lastNote = tick()
+	local a = api()
+	if a and a.say then pcall(a.say, "💺 Ты пассажир — летать может только пилот") end
+end
+
+local function manualInput()
+	if env.__SXAutoManual then pcall(env.__SXAutoManual) end
+end
+
+env.__SXKey = function(k)
+	local v = UIS:IsKeyDown(k)
+	if v and FLIGHT_KEYS[k] then
+		if env.__SXAuto then manualInput() return false end
+		if not canFly() then note() return false end
+	end
+	return v
+end
+
+env.__SXMove = function(h)
+	local v = h.MoveDirection
+	if v.Magnitude > 0.05 then
+		if env.__SXAuto then manualInput() return Vector3.zero end
+		if not canFly() then note() return Vector3.zero end
+	end
+	return v
+end
+
+env.__SXMoveVec = function(c)
+	local v = c:GetMoveVector()
+	if v.Magnitude > 0.05 then
+		if env.__SXAuto then manualInput() return Vector3.zero end
+		if not canFly() then note() return Vector3.zero end
+	end
+	return v
+end
+
+env.__SXJump = function(h)
+	local v = h.Jump
+	if v then
+		if env.__SXAuto then manualInput() return false end
+		if not canFly() then return false end
+	end
+	return v
+end
+
+---------------------------------------------------------------------
+-- 4. Твёрдый купол
+---------------------------------------------------------------------
+local GHOST = { "flame", "fire", "glow", "lens", "beam", "hint", "thrust", "beacon", "portal",
+	"liquid", "hitbox", "shadow", "aura", "zone", "trigger", "click", "particle", "smoke",
+	"light", "spark", "trail", "exhaust", "jet" }
+local GLASSY = { "dome", "glass", "capsule", "canopy", "windshield", "window", "bubble",
+	"cupola", "pane", "frame", "cockpit" }
+
+local function isGlassLike(p)
+	local n = p.Name:lower()
+	if n:find("^door") or n:find("hood", 1, true) or n:find("trunk", 1, true) then return false end
+	for _, w in ipairs(GHOST) do
+		if n:find(w, 1, true) then return false end
+	end
+	local m = p.Material
+	if m == Enum.Material.Neon or m == Enum.Material.ForceField then return false end
+	if m == Enum.Material.Glass then return true end
+	for _, w in ipairs(GLASSY) do
+		if n:find(w, 1, true) then return true end
+	end
+	local c = p.Color
+	if math.abs(c.R * 255 - 122) < 3 and math.abs(c.G * 255 - 148) < 3 and math.abs(c.B * 255 - 168) < 3 then
+		return true
+	end
+	if p.Transparency > 0.15 and p.Transparency < 0.98 then
+		local s = p.Size
+		if math.max(s.X, s.Y, s.Z) > 4 then return true end
+	end
+	return false
+end
+
+local tracked, lastScan = {}, 0
+track(RunService.Heartbeat:Connect(function()
+	local a = api()
+	if not a then return end
+	local okS, ship = pcall(a.ship)
+	if not okS or not ship or not ship.Parent then
+		tracked = {}
+		return
+	end
+	local now = tick()
+	if now - lastScan > 1 then
+		lastScan = now
+		local list = {}
+		for _, d in ipairs(ship:GetDescendants()) do
+			if d:IsA("BasePart") and isGlassLike(d) then list[#list + 1] = d end
+		end
+		tracked = list
+	end
+	for _, p in ipairs(tracked) do
+		if p.Parent and not p.CanCollide then
+			p.CanCollide = true -- твёрдый
+			-- CanQuery не трогаем: нажатия проходят сквозь стекло к креслам / дверям
+		end
+	end
+end))
+
+---------------------------------------------------------------------
+-- 4б. СТОЛКНОВЕНИЯ: стены и препятствия останавливают тарелку, она отскакивает
+---------------------------------------------------------------------
+local COLLIDE = true   -- false = снова пролетать сквозь всё
+local BOUNCE  = 0.35   -- сила отскока (0 = просто упёрся)
+
+local colInfo = { off = Vector3.zero, box = Vector3.new(6, 2, 6), ready = false, t = 0 }
+local lastPos
+local lastHit, shakeUntil, shakePower, shaken = 0, 0, 0, false
+local filter, filterT = {}, 0
+
+local function refreshBox(ship, pos)
+	local ok, cf, size = pcall(ship.GetBoundingBox, ship)
+	if ok and cf and size then
+		local w = math.max(math.min(size.X, size.Z) * 0.8, 2)
+		colInfo.box = Vector3.new(w, math.max(size.Y * 0.8, 1), w)
+		colInfo.off = cf.Position - pos
+		colInfo.ready = true
+	end
+end
+
+local function getParams(ship, a)
+	if tick() - filterT > 1 or filter[1] ~= ship then
+		filterT = tick()
+		filter = { ship }
+		local okB, b = pcall(a.beacon)
+		if okB and b then filter[#filter + 1] = b end
+		for _, pl in ipairs(Players:GetPlayers()) do
+			if pl.Character then filter[#filter + 1] = pl.Character end
+		end
+	end
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances = filter
+	rp.IgnoreWater = true
+	pcall(function() rp.RespectCanCollide = true end)
+	return rp
+end
+
+local function impact(a, speed)
+	if speed < 10 or tick() - lastHit < 0.4 then return end
+	lastHit = tick()
+	shakeUntil = tick() + 0.35
+	shakePower = math.clamp(speed / 40, 0.15, 1)
+	if a.say then pcall(a.say, "💥 Удар!") end
+end
+
+local function stepCollision()
+	local a = api()
+	if not COLLIDE or not a or not a.getPV then return end
+
+	-- тряска камеры после удара
+	local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+	if hum then
+		if tick() < shakeUntil then
+			shaken = true
+			hum.CameraOffset = Vector3.new((math.random() - 0.5) * shakePower, (math.random() - 0.5) * shakePower, 0)
+		elseif shaken then
+			shaken = false
+			hum.CameraOffset = Vector3.zero
+		end
+	end
+
+	local okS, ship = pcall(a.ship)
+	if not okS or not ship or not ship.Parent or not a.state.seated or not canFly() then
+		lastPos = nil
+		return
+	end
+
+	local pos, vel = a.getPV()
+	if typeof(pos) ~= "Vector3" then return end
+	if not lastPos then lastPos = pos return end
+
+	local st = a.state
+	local closed = not (st.doorL or st.doorR or st.hood or st.trunk)
+	if closed and tick() - colInfo.t > 1 then
+		colInfo.t = tick()
+		refreshBox(ship, pos)
+	end
+	if not colInfo.ready then lastPos = pos return end
+
+	local d = pos - lastPos
+	local dist = d.Magnitude
+	if dist < 0.001 then return end
+	if dist > 25 then lastPos = pos return end -- телепорт / спавн
+
+	local center = lastPos + colInfo.off
+	local res = Workspace:Blockcast(CFrame.new(center), colInfo.box, d, getParams(ship, a))
+	if res then
+		local n, dir = res.Normal, d.Unit
+		local inside = res.Distance < 0.02 and (n.Magnitude < 0.5 or dir:Dot(n) >= -0.01)
+		if not inside then
+			local newPos = lastPos + dir * math.max(res.Distance - 0.12, 0)
+			-- мгновенно возвращаем корабль к точке удара
+			pcall(function()
+				if ship:IsA("Model") then ship:PivotTo(ship:GetPivot() + (newPos - pos)) end
+			end)
+			local newVel, into = vel, 0
+			if typeof(vel) == "Vector3" then
+				local dn = vel:Dot(n)
+				if dn < 0 then
+					into = -dn
+					newVel = vel - (1 + BOUNCE) * dn * n
+				end
+			end
+			a.setPV(newPos, newVel)
+			lastPos = newPos
+			impact(a, into)
+			return
+		end
+	end
+	lastPos = pos
+end
+
+track(RunService.Heartbeat:Connect(function()
+	pcall(stepCollision)
+end))
+
+---------------------------------------------------------------------
+-- 4в. БЕЗ СИНЕГО СВЕЧЕНИЯ (пламя капсул, синие огни, bloom)
+---------------------------------------------------------------------
+local HIDE_BLUE_NEON = true -- true = синие неоновые детали скрыть, false = просто убрать свечение
+
+local FLAMEY = { "flame", "fire", "thrust", "jet", "exhaust", "plume", "burn" }
+
+local function isBlue(c)
+	return c.B * 255 >= c.R * 255 + 30 and c.B >= c.G - 0.02
+end
+
+local function seqBlue(s)
+	local ok, kp = pcall(function() return s.Keypoints end)
+	if ok and kp and kp[1] then return isBlue(kp[1].Value) end
+	return false
+end
+
+local function flameName(inst)
+	if not inst then return false end
+	local n = inst.Name:lower()
+	for _, w in ipairs(FLAMEY) do
+		if n:find(w, 1, true) then return true end
+	end
+	return false
+end
+
+local glowOff, glowHide, lastGlowScan = {}, {}, 0
+
+local function scanGlow(ship)
+	-- Пламя / огонь орудий НЕ трогаем. Гасим только свечение: синие источники света.
+	local off = {}
+	for _, d in ipairs(ship:GetDescendants()) do
+		if d:IsA("Light") and isBlue(d.Color) then
+			off[#off + 1] = d
+		end
+	end
+	glowOff, glowHide = off, {}
+end
+
+local function applyGlow()
+	local a = api()
+	if not a then return end
+	local okS, ship = pcall(a.ship)
+	if not okS or not ship or not ship.Parent then
+		glowOff, glowHide = {}, {}
+		return
+	end
+	local now = tick()
+	if now - lastGlowScan > 0.5 then
+		lastGlowScan = now
+		pcall(scanGlow, ship)
+	end
+	for _, x in ipairs(glowOff) do
+		if x.Parent and x.Enabled then x.Enabled = false end
+	end
+	for _, p in ipairs(glowHide) do
+		if p.Parent and p.Transparency < 1 then p.Transparency = 1 end
+	end
+end
+
+track(RunService.Heartbeat:Connect(applyGlow))
+pcall(function()
+	RunService:BindToRenderStep("SXNoGlow", Enum.RenderPriority.Last.Value, applyGlow)
+end)
+
+-- отключаем bloom-эффекты, появившиеся после запуска патча
+local function killBloom(i)
+	if i:IsA("BloomEffect") then
+		i.Enabled = false
+		track(i:GetPropertyChangedSignal("Enabled"):Connect(function()
+			if i.Enabled then i.Enabled = false end
+		end))
+	end
+end
+track(game:GetService("Lighting").DescendantAdded:Connect(killBloom))
+do
+	local cam = Workspace.CurrentCamera
+	if cam then track(cam.ChildAdded:Connect(killBloom)) end
+end
+
+---------------------------------------------------------------------
+-- 4г. АВТОПИЛОТ + КАРТА СЕРВЕРА (справа в углу)
+---------------------------------------------------------------------
+local GuiService = game:GetService("GuiService")
+local MAP_N    = 64   -- разрешение карты (MAP_N x MAP_N клеток)
+local AP_SPEED = 95   -- скорость автопилота
+local AP_CLEAR = 18   -- запас высоты над самым высоким препятствием
+
+local ap = {
+	on = false, flying = false, target = nil, vel = Vector3.zero, mode = "vel",
+	t0 = 0, lastRay = 0, groundTop = -math.huge,
+	avoidDir = nil, avoidUntil = 0, lastAvoid = 0, lastBlocked = 0, blockCount = 0, blockT = 0,
+	boost = 0, slow = false,
+	probeT = 0, probePos = nil, probeExp = 0, stuckT = 0, stuckPos = nil, uiT = 0,
+}
+local map = { ready = false, scanning = false, built = false, minX = 0, minZ = 0, size = 1000, cells = {}, t = 0 }
+local apUI = {}
+
+local ORANGE = Color3.fromRGB(255, 176, 30)
+local DARKC  = Color3.fromRGB(13, 17, 25)
+
+local function mk(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do o[k] = v end
+	o.Parent = parent
+	return o
+end
+local function round(o, r) mk("UICorner", { CornerRadius = UDim.new(0, r or 8) }, o) end
+
+local function setStatus(text)
+	if apUI.status then apUI.status.Text = text end
+end
+
+local function tryParent(g)
+	local cands = {}
+	if gethui then cands[#cands + 1] = function() return gethui() end end
+	cands[#cands + 1] = function() return game:GetService("CoreGui") end
+	cands[#cands + 1] = function() return lp:WaitForChild("PlayerGui", 5) end
+	for _, f in ipairs(cands) do
+		local ok, p = pcall(f)
+		if ok and p then
+			local ok2 = pcall(function() g.Parent = p end)
+			if ok2 and g.Parent == p then return true end
+		end
+	end
+	return false
+end
+
+local function worldToMap(x, z)
+	return UDim2.fromScale(math.clamp((x - map.minX) / map.size, 0, 1), math.clamp((z - map.minZ) / map.size, 0, 1))
+end
+
+local function refreshButtons()
+	if not apUI.btn then return end
+	if ap.flying then
+		apUI.btn.Text = "🧭 В пути (тап — стоп)"
+		apUI.btn.BackgroundColor3 = Color3.fromRGB(120, 52, 20)
+	elseif ap.on then
+		apUI.btn.Text = "🧭 Автопилот: ВКЛ"
+		apUI.btn.BackgroundColor3 = Color3.fromRGB(24, 80, 50)
+	else
+		apUI.btn.Text = "🧭 Автопилот"
+		apUI.btn.BackgroundColor3 = DARKC
+	end
+	apUI.openMap.Visible = ap.on and not apUI.panel.Visible
+end
+
+local function updateMarkers(a)
+	if not map.ready then apUI.me.Visible = false apUI.tgt.Visible = false return end
+	local okP, p = pcall(a.getPV)
+	if okP and typeof(p) == "Vector3" then
+		apUI.me.Position = worldToMap(p.X, p.Z)
+		apUI.me.Visible = true
+	end
+	if ap.target then
+		apUI.tgt.Position = worldToMap(ap.target.X, ap.target.Z)
+		apUI.tgt.Visible = true
+	else
+		apUI.tgt.Visible = false
+	end
+end
+
+local function stopAuto(msg)
+	local a = api()
+	if ap.flying and a and a.getPV then
+		local okP, p = pcall(a.getPV)
+		if okP and typeof(p) == "Vector3" then pcall(a.setPV, p, Vector3.zero) end
+	end
+	ap.on, ap.flying, ap.target, ap.vel = false, false, nil, Vector3.zero
+	ap.boost, ap.slow, ap.avoidDir = 0, false, nil
+	env.__SXAuto = false
+	if apUI.panel then apUI.panel.Visible = false end
+	if apUI.tgt then apUI.tgt.Visible = false end
+	refreshButtons()
+	if msg and a and a.say then pcall(a.say, msg) end
+end
+
+env.__SXAutoManual = function()
+	if ap.flying and tick() - ap.t0 > 1 then
+		stopAuto("🕹 Ручное управление")
+	end
+end
+
+-- ===== сканирование карты (сверху вниз лучами, цвета реальных поверхностей) =====
+local function buildCells()
+	if map.built then return end
+	map.built = true
+	local f = 1 / MAP_N
+	for j = 0, MAP_N - 1 do
+		for i = 0, MAP_N - 1 do
+			local c = Instance.new("Frame")
+			c.BorderSizePixel = 0
+			c.BackgroundColor3 = Color3.fromRGB(20, 24, 30)
+			c.Position = UDim2.new(i * f, 0, j * f, 0)
+			c.Size = UDim2.new(f, 1, f, 1)
+			c.Parent = apUI.cells
+			map.cells[j * MAP_N + i + 1] = c
+		end
+		if j % 8 == 7 then RunService.Heartbeat:Wait() end
+	end
+end
+
+local function scanMap(a)
+	if map.scanning then return end
+	map.scanning = true
+	map.ready = false
+	setStatus("Сканирую карту…")
+	buildCells()
+
+	local okS, ship = pcall(a.ship)
+	if not okS then ship = nil end
+	local okP, pp = pcall(a.getPV)
+	if not okP or typeof(pp) ~= "Vector3" then pp = Vector3.zero end
+
+	-- границы мира
+	local xs, zs, maxY = {}, {}, 0
+	local descs = Workspace:GetDescendants()
+	for idx, d in ipairs(descs) do
+		if d:IsA("BasePart") and d.Anchored then
+			local s = d.Size
+			local m = math.max(s.X, s.Y, s.Z)
+			if m > 4 and m < 3000 and not (d.Parent and d.Parent:FindFirstChildOfClass("Humanoid"))
+				and not (ship and d:IsDescendantOf(ship)) then
+				local p = d.Position
+				if math.abs(p.X) < 4000 and math.abs(p.Z) < 4000 then
+					xs[#xs + 1] = p.X
+					zs[#zs + 1] = p.Z
+					if p.Y + s.Y / 2 > maxY then maxY = p.Y + s.Y / 2 end
+				end
+			end
+		end
+		if idx % 3000 == 0 then RunService.Heartbeat:Wait() end
+	end
+
+	local cx, cz, half
+	if #xs < 3 then
+		cx, cz, half = pp.X, pp.Z, 800
+	else
+		table.sort(xs)
+		table.sort(zs)
+		local lo = math.max(1, math.floor(#xs * 0.01))
+		local hi = math.max(1, math.ceil(#xs * 0.99))
+		local x1, x2 = math.min(xs[lo], pp.X - 150), math.max(xs[hi], pp.X + 150)
+		local z1, z2 = math.min(zs[lo], pp.Z - 150), math.max(zs[hi], pp.Z + 150)
+		half = math.clamp(math.max(x2 - x1, z2 - z1) / 2 * 1.08, 200, 2500)
+		cx, cz = (x1 + x2) / 2, (z1 + z2) / 2
+	end
+	map.minX, map.minZ, map.size = cx - half, cz - half, half * 2
+
+	local topY = math.clamp(maxY + 60, 120, 2000)
+	local rp = getParams(ship or Workspace, a)
+	local cell = map.size / MAP_N
+	local total = MAP_N * MAP_N
+	local cols, hs = {}, {}
+	local minH, maxH = math.huge, -math.huge
+	local terrain = Workspace.Terrain
+
+	for k = 0, total - 1 do
+		local i, j = k % MAP_N, k // MAP_N
+		local x = map.minX + (i + 0.5) * cell
+		local z = map.minZ + (j + 0.5) * cell
+		local res = Workspace:Raycast(Vector3.new(x, topY, z), Vector3.new(0, -(topY + 1500), 0), rp)
+		if res then
+			local h = res.Position.Y
+			local inst = res.Instance
+			local col
+			if inst:IsA("Terrain") then
+				local okc, c = pcall(terrain.GetMaterialColor, terrain, res.Material)
+				col = (okc and c) or Color3.fromRGB(90, 130, 70)
+			else
+				col = inst.Color
+			end
+			cols[k + 1], hs[k + 1] = col, h
+			if h < minH then minH = h end
+			if h > maxH then maxH = h end
+		else
+			cols[k + 1], hs[k + 1] = Color3.fromRGB(14, 18, 24), false
+		end
+		if k % 160 == 159 then
+			setStatus(("Сканирую карту… %d%%"):format(k * 100 // total))
+			RunService.Heartbeat:Wait()
+		end
+	end
+
+	local range = math.max(maxH - minH, 1)
+	for k = 1, total do
+		local c, h = cols[k], hs[k]
+		local cellF = map.cells[k]
+		if cellF then
+			if h then
+				local f = 0.65 + 0.5 * ((h - minH) / range)
+				cellF.BackgroundColor3 = Color3.new(math.clamp(c.R * f, 0, 1), math.clamp(c.G * f, 0, 1), math.clamp(c.B * f, 0, 1))
+			else
+				cellF.BackgroundColor3 = c
+			end
+		end
+		if k % 900 == 0 then RunService.Heartbeat:Wait() end
+	end
+
+	map.ready, map.scanning, map.t = true, false, tick()
+	setStatus("👆 Тапни на карту — туда полетим")
+end
+
+-- ===== выбор цели =====
+local function startFlight(wx, wz)
+	ap.target = Vector3.new(wx, 0, wz)
+	ap.flying = true
+	ap.vel = Vector3.zero
+	ap.t0 = tick()
+	ap.boost, ap.slow, ap.avoidDir = 0, false, nil
+	ap.probeT, ap.probePos, ap.stuckT, ap.stuckPos = 0, nil, 0, nil
+	env.__SXAuto = true
+	apUI.panel.Visible = false
+	refreshButtons()
+	local a = api()
+	if a and a.say then pcall(a.say, "🧭 Автопилот: лечу к точке") end
+end
+
+local function enableAuto()
+	local a = api()
+	if not a or not a.getPV then
+		warn("[SaucerX+] Автопилот недоступен (API не найден)")
+		return
+	end
+	if not a.state.seated then
+		pcall(a.say, "🧭 Сядь в кресло пилота (левое)")
+		return
+	end
+	if not canFly() then
+		pcall(a.say, "💺 Пассажир не может включить автопилот")
+		return
+	end
+	ap.on = true
+	apUI.panel.Visible = true
+	refreshButtons()
+	if not map.scanning and (not map.ready or tick() - map.t > 120) then
+		task.spawn(function() pcall(scanMap, a) end)
+	else
+		setStatus("👆 Тапни на карту — туда полетим")
+	end
+	updateMarkers(a)
+end
+
+-- ===== интерфейс =====
+local function buildUI()
+	local gui = mk("ScreenGui", {
+		Name = "SXAutoGui", ResetOnSpawn = false, IgnoreGuiInset = true,
+		DisplayOrder = 50, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	})
+	if not tryParent(gui) then
+		warn("[SaucerX+] Не удалось создать интерфейс автопилота")
+		return false
+	end
+	env.__SXGui = gui
+
+	local btn = mk("TextButton", {
+		Size = UDim2.fromOffset(170, 36), AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -10, 0, 56), BackgroundColor3 = DARKC, BackgroundTransparency = 0.1,
+		Text = "🧭 Автопилот", TextColor3 = ORANGE, Font = Enum.Font.GothamBold, TextSize = 14,
+	}, gui)
+	round(btn, 10)
+	mk("UIStroke", { Color = ORANGE, Thickness = 1.5, Transparency = 0.3 }, btn)
+
+	local openMap = mk("TextButton", {
+		Size = UDim2.fromOffset(170, 32), AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -10, 0, 98), BackgroundColor3 = DARKC, BackgroundTransparency = 0.1,
+		Text = "🗺 Выбрать другую точку", TextColor3 = Color3.fromRGB(230, 235, 240),
+		Font = Enum.Font.GothamBold, TextSize = 12, Visible = false,
+	}, gui)
+	round(openMap, 10)
+
+	local panel = mk("Frame", {
+		Size = UDim2.fromOffset(250, 296), AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -10, 0, 98), BackgroundColor3 = DARKC, BackgroundTransparency = 0.08,
+		Visible = false,
+	}, gui)
+	round(panel, 12)
+	mk("UIStroke", { Color = ORANGE, Thickness = 1.5, Transparency = 0.35 }, panel)
+
+	mk("TextLabel", {
+		Size = UDim2.new(1, -44, 0, 26), Position = UDim2.fromOffset(10, 2), BackgroundTransparency = 1,
+		Text = "🗺 Карта сервера", TextColor3 = ORANGE, Font = Enum.Font.GothamBold, TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, panel)
+
+	local refresh = mk("TextButton", {
+		Size = UDim2.fromOffset(30, 22), Position = UDim2.new(1, -38, 0, 4),
+		BackgroundColor3 = Color3.fromRGB(40, 48, 60), Text = "⟳", TextColor3 = Color3.new(1, 1, 1),
+		Font = Enum.Font.GothamBold, TextSize = 14,
+	}, panel)
+	round(refresh, 6)
+
+	local holder = mk("Frame", {
+		Size = UDim2.fromOffset(230, 230), Position = UDim2.fromOffset(10, 28),
+		BackgroundColor3 = Color3.fromRGB(8, 10, 14), ClipsDescendants = true,
+	}, panel)
+	round(holder, 8)
+
+	local cells = mk("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 1 }, holder)
+
+	local tgt = mk("Frame", {
+		Size = UDim2.fromOffset(14, 14), AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundColor3 = Color3.fromRGB(255, 60, 60), Visible = false, ZIndex = 4,
+	}, holder)
+	round(tgt, 7)
+	mk("UIStroke", { Color = Color3.new(1, 1, 1), Thickness = 2 }, tgt)
+
+	local me = mk("Frame", {
+		Size = UDim2.fromOffset(12, 12), AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundColor3 = ORANGE, Visible = false, ZIndex = 5,
+	}, holder)
+	round(me, 6)
+	mk("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 2 }, me)
+
+	local click = mk("TextButton", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", ZIndex = 8,
+	}, holder)
+
+	local status = mk("TextLabel", {
+		Size = UDim2.new(1, -16, 0, 30), Position = UDim2.fromOffset(8, 262), BackgroundTransparency = 1,
+		Text = "", TextColor3 = Color3.fromRGB(215, 222, 230), Font = Enum.Font.Gotham, TextSize = 12,
+		TextWrapped = true,
+	}, panel)
+
+	apUI.gui, apUI.btn, apUI.openMap, apUI.panel = gui, btn, openMap, panel
+	apUI.cells, apUI.me, apUI.tgt, apUI.status, apUI.holder = cells, me, tgt, status, holder
+
+	track(btn.Activated:Connect(function()
+		if ap.on then
+			stopAuto("🧭 Автопилот выключен")
+		else
+			enableAuto()
+		end
+	end))
+
+	track(openMap.Activated:Connect(function()
+		panel.Visible = true
+		refreshButtons()
+		local a = api()
+		if a then updateMarkers(a) end
+	end))
+
+	track(refresh.Activated:Connect(function()
+		local a = api()
+		if a and not map.scanning then task.spawn(function() pcall(scanMap, a) end) end
+	end))
+
+	track(click.Activated:Connect(function(input)
+		if not map.ready then return end
+		local tl, sz = holder.AbsolutePosition, holder.AbsoluteSize
+		local p
+		if input and input.Position then
+			local raw = Vector2.new(input.Position.X, input.Position.Y)
+			local withInset = raw + GuiService:GetGuiInset()
+			local function inside(v) return v.X >= tl.X and v.X <= tl.X + sz.X and v.Y >= tl.Y and v.Y <= tl.Y + sz.Y end
+			if inside(withInset) then p = withInset elseif inside(raw) then p = raw else p = withInset end
+		else
+			p = UIS:GetMouseLocation()
+		end
+		local rx = math.clamp((p.X - tl.X) / sz.X, 0, 1)
+		local ry = math.clamp((p.Y - tl.Y) / sz.Y, 0, 1)
+		startFlight(map.minX + rx * map.size, map.minZ + ry * map.size)
+		local a = api()
+		if a then updateMarkers(a) end
+	end))
+
+	return true
+end
+
+pcall(buildUI)
+
+-- ===== полёт автопилота =====
+local function pathClear(a, ship, pos, h, L, up)
+	local box = colInfo.ready and colInfo.box or Vector3.new(10, 3, 10)
+	local c = pos + colInfo.off + Vector3.new(0, up or 0, 0)
+	return Workspace:Blockcast(CFrame.new(c), box, h * L, getParams(ship, a)) == nil
+end
+
+local function stepAuto(dt)
+	if not ap.flying then return end
+	local a = api()
+	if not a or not a.getPV then return stopAuto() end
+	local okS, ship = pcall(a.ship)
+	if not okS or not ship or not ship.Parent or not a.state.seated or not canFly() then
+		return stopAuto("🧭 Автопилот выключен")
+	end
+	local pos = a.getPV()
+	if typeof(pos) ~= "Vector3" then return end
+	local now = tick()
+
+	local flat = Vector3.new(ap.target.X - pos.X, 0, ap.target.Z - pos.Z)
+	local hd = flat.Magnitude
+	if hd < 12 then
+		return stopAuto("📍 Прилетели!")
+	end
+	local dir = flat.Unit
+
+	-- высота: летим над самой высокой поверхностью на пути
+	if now - ap.lastRay > 0.1 then
+		ap.lastRay = now
+		local rp = getParams(ship, a)
+		local top = -math.huge
+		for _, dd in ipairs({ 0, 25, 55, 90, 140, hd }) do
+			if dd <= hd + 1 then
+				local p = pos + dir * dd
+				local res = Workspace:Raycast(Vector3.new(p.X, pos.Y + 250, p.Z), Vector3.new(0, -700, 0), rp)
+				if res and res.Position.Y > top then top = res.Position.Y end
+			end
+		end
+		ap.groundTop = top
+	end
+	local baseY = ap.groundTop > -math.huge and (ap.groundTop + AP_CLEAR) or pos.Y
+	local wantY = baseY + ap.boost
+	local vy = math.clamp((wantY - pos.Y) * 1.8, -22, 42)
+
+	-- обход препятствий
+	local heading = (ap.avoidDir and now < ap.avoidUntil) and ap.avoidDir or dir
+	local look = math.clamp(ap.vel.Magnitude * 0.7, 28, 70)
+	if now - ap.lastAvoid > 0.1 and not (ap.avoidDir and now < ap.avoidUntil) then
+		ap.lastAvoid = now
+		if pathClear(a, ship, pos, dir, look) then
+			ap.slow = false
+			ap.avoidDir = nil
+			if now - ap.lastBlocked > 2 then ap.boost = math.max(0, ap.boost - 12 * 0.1) end
+		else
+			ap.lastBlocked = now
+			if now - ap.blockT > 4 then ap.blockT, ap.blockCount = now, 0 end
+			ap.blockCount += 1
+			local found
+			for _, deg in ipairs({ 35, -35, 70, -70, 110, -110 }) do
+				local h = CFrame.Angles(0, math.rad(deg), 0):VectorToWorldSpace(dir)
+				if pathClear(a, ship, pos, h, look) then found = h break end
+			end
+			if found and ap.blockCount <= 5 then
+				ap.avoidDir, ap.avoidUntil, heading, ap.slow = found, now + 0.9, found, false
+			else
+				-- боковых путей нет (или кружим) — перелетаем сверху
+				ap.boost = math.min(ap.boost + 30, 220)
+				ap.blockCount = 0
+				ap.slow = true
+			end
+		end
+	end
+
+	local spd = math.min(AP_SPEED, hd * 1.1 + 10)
+	if ap.slow then spd = spd * 0.25 end
+	local desired = heading * spd + Vector3.new(0, vy, 0)
+	ap.vel = ap.vel:Lerp(desired, 1 - math.exp(-3 * dt))
+
+	-- проверка: двигает ли корабль через скорость (vel) или нужно двигать позицией
+	if ap.mode == "vel" then
+		if not ap.probePos then
+			ap.probePos, ap.probeT, ap.probeExp = pos, now, 0
+		else
+			ap.probeExp += ap.vel.Magnitude * dt
+			if now - ap.probeT > 0.9 then
+				local moved = (pos - ap.probePos).Magnitude
+				if ap.probeExp > 20 and moved < ap.probeExp * 0.3 then ap.mode = "pos" end
+				ap.probePos = nil
+			end
+		end
+	end
+
+	if ap.mode == "vel" then
+		a.setPV(pos, ap.vel)
+	else
+		local newPos = pos + ap.vel * dt
+		pcall(function()
+			if ship:IsA("Model") then ship:PivotTo(ship:GetPivot() + (newPos - pos)) end
+		end)
+		a.setPV(newPos, ap.vel)
+	end
+
+	-- застряли? поднимаемся выше
+	if not ap.stuckPos then
+		ap.stuckPos, ap.stuckT = pos, now
+	elseif now - ap.stuckT > 3 then
+		if (Vector3.new(pos.X, 0, pos.Z) - Vector3.new(ap.stuckPos.X, 0, ap.stuckPos.Z)).Magnitude < 4 and spd > 20 then
+			ap.boost = math.min(ap.boost + 30, 220)
+		end
+		ap.stuckPos, ap.stuckT = pos, now
+	end
+end
+
+track(RunService.Heartbeat:Connect(function(dt)
+	pcall(stepAuto, dt)
+	if tick() - ap.uiT > 0.2 then
+		ap.uiT = tick()
+		local a = api()
+		if a and apUI.panel and apUI.panel.Visible then pcall(updateMarkers, a) end
+	end
+end))
+
+---------------------------------------------------------------------
+-- 5. Тап по двери / капоту / багажнику: открыть <-> закрыть
+--    (страховка: если оригинал не отреагировал, переключаем сами)
+---------------------------------------------------------------------
+local TOGGLE = { doorL = true, doorR = true, hood = true, trunk = true }
+local started = {}
+
+track(UIS.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	local t = input.UserInputType
+	if t == Enum.UserInputType.Touch or t == Enum.UserInputType.MouseButton1 then
+		started[input] = { x = input.Position.X, y = input.Position.Y, t = tick() }
+	end
+end))
+
+track(UIS.InputEnded:Connect(function(input)
+	local s = started[input]
+	if not s then return end
+	started[input] = nil
+
+	local dx, dy = input.Position.X - s.x, input.Position.Y - s.y
+	if math.sqrt(dx * dx + dy * dy) > 14 or tick() - s.t > 0.45 then return end -- это был свайп камеры
+
+	local a = api()
+	if not a then return end
+	local okS, ship = pcall(a.ship)
+	if not okS or not ship then return end
+
+	local cam = Workspace.CurrentCamera
+	if not cam then return end
+	local ray = cam:ScreenPointToRay(input.Position.X, input.Position.Y)
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	if lp.Character then rp.FilterDescendantsInstances = { lp.Character } end
+	local res = Workspace:Raycast(ray.Origin, ray.Direction * 1000, rp)
+	if not res then return end
+
+	local act = a.acts[res.Instance]
+	if not act or not act.name or not TOGGLE[act.name] then return end
+
+	local g = act.name
+	local before = a.state[g]
+	task.delay(0.3, function()
+		-- если оригинальный обработчик уже переключил — ничего не делаем
+		if a.state[g] == before then
+			pcall(a.setGroup, g, not before)
+		end
+	end)
+end))
+
+---------------------------------------------------------------------
+-- 6. Запуск (если патч сломал код — запускаем оригинал)
+---------------------------------------------------------------------
+local fn, err = loadstring(patched, "SaucerX_v6_patched")
+if not fn then
+	warn("[SaucerX+] Патч не скомпилировался (" .. tostring(err) .. "). Запускаю оригинал.")
+	env.__SXApi = nil
+	fn = loadstring(src, "SaucerX_v6")
+end
+
+if fn then
+	local ok, e = pcall(fn)
+	if not ok then warn("[SaucerX+] Ошибка скрипта: " .. tostring(e)) end
+else
+	warn("[SaucerX+] Не удалось загрузить скрипт.")
+end
